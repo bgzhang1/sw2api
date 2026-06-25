@@ -9,6 +9,12 @@ build/
 .venv/
 venv/
 
+# Debug / test / standalone tools
+debug_api.py
+debug_otp.py
+decrypt_session.py
+machine_id.py
+
 # Sensitive data - credentials
 data/config.json
 data/api_keys.json
