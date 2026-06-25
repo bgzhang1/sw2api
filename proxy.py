@@ -36,6 +36,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, urlencode, parse_qs
 from http.client import HTTPSConnection
 from pathlib import Path
+import call_log
 import health_tracker
 import key_manager
 import usage_store
@@ -558,6 +559,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 streaming = True
 
             tokens_used = 0
+            model = "unknown"
+            i_tokens = 0
+            o_tokens = 0
             if streaming:
                 last_data = None
                 while True:
@@ -570,22 +574,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         last_data = chunk
                     except BrokenPipeError:
                         break
-                if api_key and last_data:
+                if last_data:
                     for line in last_data.decode("utf-8", errors="replace").split("\n"):
                         if line.startswith("data: ") and "[DONE]" not in line:
                             try:
                                 d = json.loads(line[6:])
+                                model = d.get("model", model)
                                 u = d.get("usage", {})
-                                tokens_used = u.get("total_tokens", 0)
+                                i_tokens = u.get("prompt_tokens", 0) or i_tokens
+                                o_tokens = u.get("completion_tokens", 0) or o_tokens
+                                tokens_used = u.get("total_tokens", 0) or tokens_used
                             except Exception:
                                 pass
             else:
                 data = resp.read()
                 self.wfile.write(data)
-                if api_key and resp.status == 200:
+                if resp.status == 200:
                     try:
                         d = json.loads(data.decode("utf-8", errors="replace"))
+                        model = d.get("model", model)
                         u = d.get("usage", {})
+                        i_tokens = u.get("prompt_tokens", 0)
+                        o_tokens = u.get("completion_tokens", 0)
                         tokens_used = u.get("total_tokens", 0)
                     except Exception:
                         pass
@@ -596,6 +606,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 usage_store.record_usage(tokens_used)
             if api_key and tokens_used > 0:
                 key_manager.record_usage(api_key, tokens_used)
+                call_log.record(model, email, i_tokens, o_tokens)
             elif api_key:
                 key_manager.record_usage(api_key, 0, 1)
 

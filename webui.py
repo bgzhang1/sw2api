@@ -28,6 +28,7 @@ from http.client import HTTPSConnection
 from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, Response
+import call_log
 import key_manager
 import health_tracker
 import usage_store
@@ -656,6 +657,9 @@ def _start_proxy_instance(port):
                 self._responded = True
                 ct = resp.getheader("content-type", "")
                 tokens_used = 0
+                model = "unknown"
+                i_tokens = 0
+                o_tokens = 0
                 if "text/event-stream" in ct:
                     last_chunk = None
                     while True:
@@ -668,21 +672,29 @@ def _start_proxy_instance(port):
                             last_chunk = chunk
                         except BrokenPipeError:
                             break
-                    if api_key and last_chunk:
+                    if last_chunk:
                         for line in last_chunk.decode("utf-8", errors="replace").split("\n"):
                             if line.startswith("data: ") and "[DONE]" not in line:
                                 try:
                                     d = json.loads(line[6:])
-                                    tokens_used = d.get("usage", {}).get("total_tokens", 0)
+                                    model = d.get("model", model)
+                                    u = d.get("usage", {})
+                                    i_tokens = u.get("prompt_tokens", 0) or i_tokens
+                                    o_tokens = u.get("completion_tokens", 0) or o_tokens
+                                    tokens_used = u.get("total_tokens", 0) or tokens_used
                                 except Exception:
                                     pass
                 else:
                     data = resp.read()
                     self.wfile.write(data)
-                    if api_key and resp.status == 200:
+                    if resp.status == 200:
                         try:
                             d = json.loads(data.decode("utf-8", errors="replace"))
-                            tokens_used = d.get("usage", {}).get("total_tokens", 0)
+                            model = d.get("model", model)
+                            u = d.get("usage", {})
+                            i_tokens = u.get("prompt_tokens", 0)
+                            o_tokens = u.get("completion_tokens", 0)
+                            tokens_used = u.get("total_tokens", 0)
                         except Exception:
                             pass
                 conn.close()
@@ -690,6 +702,7 @@ def _start_proxy_instance(port):
                     usage_store.record_usage(tokens_used)
                 if api_key and tokens_used > 0:
                     key_manager.record_usage(api_key, tokens_used)
+                    call_log.record(model, email, i_tokens, o_tokens)
                 elif api_key:
                     key_manager.record_usage(api_key, 0, 1)
             except Exception as e:
@@ -923,6 +936,13 @@ def api_chat():
         return jsonify({"error": str(e)})
     finally:
         conn.close()
+
+
+@app.route("/api/call-log")
+def api_call_log():
+    page = request.args.get("page", 1, type=int)
+    per_page = request.args.get("per_page", 10, type=int)
+    return jsonify(call_log.get_page(page, per_page))
 
 
 @app.route("/api/keys")

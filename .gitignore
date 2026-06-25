@@ -27,6 +27,7 @@ retry2_results.json
 
 # Retry scripts with hardcoded credentials
 retry2.py
+retry3.py
 
 # Sensitive data - credentials
 data/config.json
