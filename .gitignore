@@ -52,3 +52,4 @@ Thumbs.db
 # Environment
 .env
 .env.local
+sw2api/
