@@ -1,6 +1,8 @@
 # sw2api
 
 stagewise 多账号反向代理 + Web 管理面板。OpenAI 兼容接口，支持多账号自动切号、限额冷却、本地 API 密钥管理。
+<img width="3143" height="1760" alt="image" src="https://github.com/user-attachments/assets/23c5dc5c-df89-4b76-848e-731b541c76b2" />
+
 
 ## 功能
 
