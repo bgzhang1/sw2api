@@ -754,7 +754,7 @@ def api_llm_test():
 def api_accounts():
     cfg = load_config()
     active = cfg.get("activeAccount")
-    entries = {email: {"email": email, "tokenPreview": None, "user": acct.get("user"), "active": email == active, "usage": None, "expiresAt": None} for email, acct in cfg.get("accounts", {}).items()}
+    entries = {email: {"email": email, "tokenPreview": None, "user": acct.get("user"), "active": email == active, "disabled": acct.get("disabled", False), "usage": None, "expiresAt": None} for email, acct in cfg.get("accounts", {}).items()}
 
     tasks = {}
     with ThreadPoolExecutor(max_workers=16) as pool:

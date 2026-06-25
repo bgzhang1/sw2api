@@ -421,7 +421,12 @@ async function toggleAccount(email, action) {
   if (r && r.success) {
     toast(email.split('@')[0] + ' ' + (action === 'disable' ? 'disabled' : 'enabled'), 'success');
     refreshAccounts();
+    loadAccounts();
   }
+}
+
+async function toggleAccountAccount(email, action) {
+  await toggleAccount(email, action);
 }
 
 function renderAccountStatus(accts) {
@@ -624,8 +629,10 @@ function renderAccounts(cols) {
         </div>
       </div>
       <div class="flex gap-2 mb-3">
-        ${isActive ? '<span class="text-sm font-semibold px-3 py-1 rounded-full bg-emerald-100 text-emerald-700">Active</span>'
-          : `<button class="px-3 py-1 text-sm font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700" onclick="switchAccount('${acct.email.replace(/'/g,"\\'")}')">Switch</button>`}
+        ${acct.disabled ? '<span class="text-sm font-semibold px-3 py-1 rounded-full bg-slate-100 text-slate-500">Disabled</span>'
+          : (isActive ? '<span class="text-sm font-semibold px-3 py-1 rounded-full bg-emerald-100 text-emerald-700">Active</span>'
+          : `<button class="px-3 py-1 text-sm font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700" onclick="switchAccount('${acct.email.replace(/'/g,"\\'")}')">Switch</button>`)}
+        <button class="px-3 py-1 text-sm font-medium ${acct.disabled ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-slate-200 text-slate-600 hover:bg-slate-300'} rounded-lg" onclick="toggleAccountAccount('${acct.email.replace(/'/g,"\\'")}', '${acct.disabled ? 'enable' : 'disable'}')">${acct.disabled ? 'Enable' : 'Disable'}</button>
         <button class="px-3 py-1 text-sm font-medium bg-red-600 text-white rounded-lg hover:bg-red-700" onclick="removeAccount('${acct.email.replace(/'/g,"\\'")}')">Delete</button>
       </div>
       <div class="flex-1">${infoHtml}</div>
