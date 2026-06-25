@@ -535,7 +535,8 @@ def _start_proxy_instance(port):
             is_chat = "/chat/completions" in self.path
             api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
             if is_chat or api_key:
-                if not api_key:
+                is_local = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+                if not api_key and not is_local:
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
                     self._cors()
@@ -834,101 +835,40 @@ def api_accounts_remove():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    cfg_path = Path(__file__).parent / "data" / "config.json"
-    cfg = json.loads(cfg_path.read_text("utf-8"))
-    active = cfg.get("activeAccount")
-    token = cfg["accounts"][active]["token"] if active and active in cfg.get("accounts", {}) else None
-    if not token:
-        return jsonify({"error": "No active account"}), 401
-
     message = request.json.get("message", "")
-    model = request.json.get("model", "deepseek/deepseek-v4-flash")
+    model = request.json.get("model", "deepseek-v4-flash")
+    if "/" not in model:
+        model = "deepseek/" + model
     stream = request.json.get("stream", True)
-    base_payload = {
-        "model": model,
-        "reasoning": {"enabled": True, "effort": "low"},
-        "provider": {"require_parameters": True},
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [{"type": "text", "text": message}]},
-        ],
-    }
 
-    import http.client as _http
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": message}],
+        "stream": stream,
+    }
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
+
+    proxy_url = f"http://localhost:{proxy_state['port']}/v1/chat/completions"
+
+    try:
+        r = requests.post(proxy_url, json=payload,
+            headers={"Content-Type": "application/json"},
+            stream=stream, timeout=120)
+    except Exception as e:
+        return jsonify({"error": f"Proxy unavailable: {e}"}), 502
 
     if stream:
-        body_bytes = json.dumps({**base_payload, "stream": True, "stream_options": {"include_usage": True}}, ensure_ascii=False).encode("utf-8")
-        conn = _http.HTTPSConnection(API_HOST, timeout=120)
-        try:
-            conn.request("POST", "/v1/ai/chat/completions", body=body_bytes, headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-                "X-Stagewise-Client": "electron/1.10.2",
-                "Content-Length": str(len(body_bytes)),
-            })
-            resp = conn.getresponse()
-        except Exception as e:
-            conn.close()
-            return jsonify({"error": f"Stream request failed: {e}"}), 502
-
-        if resp.status != 200:
-            err_body = resp.read().decode("utf-8", errors="replace")
-            conn.close()
-            try:
-                err_json = json.loads(err_body)
-                msg = err_json.get("error", {})
-                if isinstance(msg, dict):
-                    msg = msg.get("message", err_body[:300])
-                return jsonify({"error": msg, "status": resp.status}), resp.status
-            except Exception:
-                return jsonify({"error": err_body[:300], "status": resp.status}), resp.status
-
         def generate():
-            try:
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
+            for chunk in r.iter_content(chunk_size=4096):
+                if chunk:
                     yield chunk
-            finally:
-                conn.close()
-        return Response(generate(), content_type="text/event-stream")
-
-    body_bytes = json.dumps(base_payload, ensure_ascii=False).encode("utf-8")
-    conn = _http.HTTPSConnection(API_HOST, timeout=120)
-    try:
-        conn.request("POST", "/v1/ai/chat/completions", body=body_bytes, headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Stagewise-Client": "electron/1.10.2",
-            "Content-Length": str(len(body_bytes)),
-        })
-        resp = conn.getresponse()
-    except Exception as e:
-        conn.close()
-        return jsonify({"error": f"Request failed: {e}"}), 502
-
-    if resp.status != 200:
-        err_body = resp.read().decode("utf-8", errors="replace")
-        conn.close()
-        try:
-            err_json = json.loads(err_body)
-            msg = err_json.get("error", {})
-            if isinstance(msg, dict):
-                msg = msg.get("message", err_body[:300])
-            return jsonify({"error": msg, "status": resp.status}), resp.status
-        except Exception:
-            return jsonify({"error": err_body[:300], "status": resp.status}), resp.status
+        return Response(generate(), content_type=r.headers.get("content-type", "text/event-stream"))
 
     try:
-        data = json.loads(resp.read().decode("utf-8"))
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)})
-    finally:
-        conn.close()
+        return jsonify(r.json())
+    except Exception:
+        return jsonify({"error": r.text[:500]}), r.status_code
 
 
 @app.route("/api/call-log")

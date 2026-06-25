@@ -453,7 +453,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         is_chat = "/chat/completions" in self.path
         api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
         if is_chat or api_key:
-            if not api_key:
+            is_local = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+            if not api_key and not is_local:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self._cors_headers()
