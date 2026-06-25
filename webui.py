@@ -491,10 +491,56 @@ def _start_proxy_instance(port):
             self.end_headers()
 
         def do_GET(self):
+            if self.path in ("/v1/models", "/models"):
+                self._handle_models()
+                return
             self._proxy()
 
         def do_POST(self):
             self._proxy()
+
+        def _handle_models(self):
+            models = [
+                {"id": "claude-fable-5", "object": "model", "owned_by": "anthropic"},
+                {"id": "claude-opus-4.8", "object": "model", "owned_by": "anthropic"},
+                {"id": "claude-opus-4.7", "object": "model", "owned_by": "anthropic"},
+                {"id": "claude-opus-4.6", "object": "model", "owned_by": "anthropic"},
+                {"id": "claude-sonnet-4.6", "object": "model", "owned_by": "anthropic"},
+                {"id": "claude-haiku-4.5", "object": "model", "owned_by": "anthropic"},
+                {"id": "gpt-5.5", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-5.4", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-5.3-codex", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-5.3-chat", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-5.4-mini", "object": "model", "owned_by": "openai"},
+                {"id": "gpt-5.4-nano", "object": "model", "owned_by": "openai"},
+                {"id": "gemini-3.1-pro-preview", "object": "model", "owned_by": "google"},
+                {"id": "gemini-3.5-flash", "object": "model", "owned_by": "google"},
+                {"id": "gemini-3-flash-preview", "object": "model", "owned_by": "google"},
+                {"id": "gemini-3.1-flash-lite", "object": "model", "owned_by": "google"},
+                {"id": "kimi-k2.7-code", "object": "model", "owned_by": "moonshotai"},
+                {"id": "kimi-k2.6", "object": "model", "owned_by": "moonshotai"},
+                {"id": "kimi-k2.5", "object": "model", "owned_by": "moonshotai"},
+                {"id": "qwen3-32b", "object": "model", "owned_by": "alibaba"},
+                {"id": "qwen3-coder-30b-a3b-instruct", "object": "model", "owned_by": "alibaba"},
+                {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"},
+                {"id": "deepseek-v4-flash", "object": "model", "owned_by": "deepseek"},
+                {"id": "glm-5.2", "object": "model", "owned_by": "z-ai"},
+                {"id": "glm-5.1", "object": "model", "owned_by": "z-ai"},
+                {"id": "glm-5v-turbo", "object": "model", "owned_by": "z-ai"},
+                {"id": "minimax-m3", "object": "model", "owned_by": "minimax"},
+                {"id": "minimax-m2.7", "object": "model", "owned_by": "minimax"},
+                {"id": "MiniMax-M2", "object": "model", "owned_by": "minimax"},
+                {"id": "mimo-v2.5-pro", "object": "model", "owned_by": "xiaomi-mimo"},
+                {"id": "mimo-v2.5", "object": "model", "owned_by": "xiaomi-mimo"},
+            ]
+            resp = {"object": "list", "data": models}
+            body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")

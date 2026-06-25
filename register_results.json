@@ -1,0 +1,42 @@
+[
+  {
+    "email": "MilanKade1183@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "RussellCanaan5540@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "KaisenBalthazar9963@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "ThomasHarrison3142@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "ReignJosie2062@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "MeridaJulia4893@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "MicahHome6286@outlook.com",
+    "status": "fail",
+    "step": "extract_otp"
+  },
+  {
+    "email": "PlumAlaia1998@outlook.com",
+    "status": "success",
+    "token": ""
+  }
+]
