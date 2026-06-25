@@ -550,7 +550,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     save_config(cfg)
 
             status = resp.status
-            if status in (401, 403, 429) or (500 <= status < 600):
+            if status in (401, 402, 403, 429) or (500 <= status < 600):
                 state = get_account_state(email)
                 state.apply_cooldown(status)
 
@@ -601,6 +601,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if resp.status == 200:
                     try:
                         d = json.loads(data.decode("utf-8", errors="replace"))
+                        if d.get("error"):
+                            state = get_account_state(email)
+                            state.apply_cooldown(429)
                         model = d.get("model", model)
                         u = d.get("usage", {})
                         i_tokens = u.get("prompt_tokens", 0)
