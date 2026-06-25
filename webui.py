@@ -615,9 +615,7 @@ def _start_proxy_instance(port):
                         req = json.loads(body.decode("utf-8"))
                         req.setdefault("reasoning", {"enabled": True, "effort": "low"})
                         req.setdefault("provider", {"require_parameters": True})
-                        has_system = any(m.get("role") == "system" for m in req.get("messages", []))
-                        if not has_system:
-                            req.setdefault("messages", []).insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                        req.setdefault("messages", []).insert(0, {"role": "system", "content": SYSTEM_PROMPT})
                         body = json.dumps(req, ensure_ascii=False).encode("utf-8")
                     except Exception:
                         pass

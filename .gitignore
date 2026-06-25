@@ -24,6 +24,7 @@ system_prompt.txt
 # Generated registration results (contains emails)
 register_results.json
 retry2_results.json
+retry3_results.json
 
 # Retry scripts with hardcoded credentials
 retry2.py
