@@ -14,7 +14,11 @@ debug_api.py
 debug_otp.py
 decrypt_session.py
 machine_id.py
+debug_mail.py
 TECHNICAL_DOC.md
+
+# Generated registration results (contains emails)
+register_results.json
 
 # Sensitive data - credentials
 data/config.json
