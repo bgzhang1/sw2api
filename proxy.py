@@ -8,10 +8,9 @@ Full lifecycle:
   3. Auto-refresh session every 5 minutes
   4. Reverse-proxy LLM requests -> https://api.stagewise.io
   5. OpenAI-compatible API on localhost
-  6. Multi-account support with 3 strategies:
+  6. Multi-account support with 2 strategies:
      - specific:  use activeAccount only (default)
      - fill_first: burn through one account at a time
-     - round_robin: distribute across all available accounts
 
 Usage:
   python proxy.py --login          Interactive email OTP login
@@ -37,9 +36,7 @@ from urllib.parse import urlparse, urlencode, parse_qs
 from http.client import HTTPSConnection
 from pathlib import Path
 import call_log
-import health_tracker
 import key_manager
-import usage_store
 
 API_ORIGIN = "https://api.stagewise.io"
 SYSTEM_PROMPT = "The following sections define your identity and operating environment:- `<soul>` — Identity, behavior rules, and values- `<environment>` — Tools, interfaces, file system, and skill system- `<output-style>` — Response formatting and special protocols- `<authorities>` — Trust hierarchy and security model### Priority Hierarchy1. **`plugins/{id}/SKILL.md`** — Core intrinsic knowledge. Always prefer.2. **`globalskills-sw/*`** — User-level skills from `~/.stagewise/skills/`. Personal defaults across all workspaces.3. **`{WORKSPACE}/.stagewise/skills/*`** — Workspace-specific, created for you. Overrides general skills.4. **`globalskills-agents/*`** — Cross-agent user-level skills from `~/.agents/skills/`.5. **`{WORKSPACE}/.agents/skills/*`** — General skills shared with other agents.## AGENTS.md (Legacy)Inside a workspace, an `AGENTS.md` file at the workspace root may carry legacy project documentation written for previous coding agents. **Ignore this file unless you already have it loaded in your context** — the canonical project memo lives at `.stagewise/WORKSPACE.md` (see the WORKSPACE.md section below). Never read `AGENTS.md` proactively to warm up on a project; rely on `<agents-md>` entries that already surface it."
@@ -53,10 +50,11 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 # ─── Strategy constants ─────────────────────────────────────────
 STRATEGY_SPECIFIC = "specific"
 STRATEGY_FILL_FIRST = "fill_first"
-STRATEGY_ROUND_ROBIN = "round_robin"
 
 # Cooldown durations (seconds)
-
+COOLDOWN_429 = 60
+COOLDOWN_5XX = 30
+DEFAULT_RETRY_AFTER = 30
 
 
 class AccountState:
@@ -64,20 +62,33 @@ class AccountState:
         self.email = email
         self.banned = False
         self.banned_reason = ""
+        self.cooldown_until = 0.0
 
     def unban(self):
         self.banned = False
         self.banned_reason = ""
 
+    def set_cooldown(self, seconds, now=None):
+        if now is None:
+            now = time.time()
+        self.cooldown_until = now + seconds
+
     def is_available(self, now=None):
-        return not self.banned
+        if self.banned:
+            return False
+        if now is None:
+            now = time.time()
+        return now >= self.cooldown_until
+
+    def cooldown_remaining(self, now=None):
+        if now is None:
+            now = time.time()
+        return max(0.0, self.cooldown_until - now)
 
 
 # Module-level account state (thread-safe)
 _account_states_lock = threading.Lock()
 _account_states = {}
-_rr_cursors = {}
-_rr_lock = threading.Lock()
 _config_lock = threading.Lock()
 
 
@@ -86,6 +97,60 @@ def get_account_state(email):
         if email not in _account_states:
             _account_states[email] = AccountState(email)
         return _account_states[email]
+
+
+def handle_upstream_status(email, status, cfg):
+    """Apply cooldown/disable based on upstream status.
+    Returns (out_status, retry_seconds):
+      - out_status: status to send to client (403 -> 429 so downstream retries)
+      - retry_seconds: Retry-After hint, or None
+    403 (plan limit) -> disable account, re-enabled by refresh-usage.
+    """
+    if not email:
+        return status, None
+
+    if status == 429:
+        state = get_account_state(email)
+        state.set_cooldown(COOLDOWN_429)
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {email} cooled down {COOLDOWN_429}s (429)")
+        return 429, COOLDOWN_429
+
+    if 500 <= status < 600:
+        state = get_account_state(email)
+        state.set_cooldown(COOLDOWN_5XX)
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {email} cooled down {COOLDOWN_5XX}s (5xx)")
+        return 429, COOLDOWN_5XX
+
+    if status in (401, 402, 403):
+        if email in cfg.get("accounts", {}):
+            cfg["accounts"][email]["disabled"] = True
+            save_config(cfg)
+        retry = next_available_in(cfg)
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {email} disabled (status {status}), retry in {retry}s")
+        return 429, retry
+
+    return status, None
+
+
+def next_available_in(cfg, now=None):
+    """Seconds until the next cooled-down account becomes available."""
+    if now is None:
+        now = time.time()
+    soonest = None
+    for email in cfg.get("accounts", {}):
+        if cfg["accounts"][email].get("disabled"):
+            continue
+        state = get_account_state(email)
+        rem = state.cooldown_remaining(now)
+        if rem > 0:
+            if soonest is None or rem < soonest:
+                soonest = rem
+    if soonest is None:
+        return DEFAULT_RETRY_AFTER
+    return int(soonest) + 1
 
 
 def get_available_accounts(cfg, now=None):
@@ -129,13 +194,6 @@ def select_account(cfg, strategy, specific_email=None):
 
     if strategy == STRATEGY_FILL_FIRST:
         return available[0]
-
-    if strategy == STRATEGY_ROUND_ROBIN:
-        with _rr_lock:
-            idx = _rr_cursors.get("__global__", 0)
-            email, acct = available[idx % len(available)]
-            _rr_cursors["__global__"] = idx + 1
-        return email, acct
 
     email = cfg.get("activeAccount")
     if email and email in accounts:
@@ -428,16 +486,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         email, acct, token = self._select_request_account()
         if not token:
             ts = time.strftime("%H:%M:%S")
-            print(f"[{ts}] No available account (strategy={self.__class__.config.get('strategy', '?')})")
+            retry = next_available_in(self.__class__.config)
+            print(f"[{ts}] No available account (strategy={self.__class__.config.get('strategy', '?')}), retry in {retry}s")
             self.send_response(429)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "30")
+            self.send_header("Retry-After", str(retry))
             self._cors_headers()
             self.end_headers()
             self.wfile.write(json.dumps({
                 "error": {
                     "code": "account_unavailable",
-                    "message": "All accounts are cooling down",
+                    "message": "All accounts are cooling down, retry later",
                 }
             }).encode("utf-8"))
             return
@@ -490,8 +549,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             conn.request(self.command, path, body=body, headers=upstream_headers)
             resp = conn.getresponse()
 
-            health_tracker.record_request(success=200 <= resp.status < 400)
-
             set_auth = resp.getheader("set-auth-token")
             if set_auth:
                 ts = time.strftime("%H:%M:%S")
@@ -502,17 +559,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     save_config(cfg)
 
             status = resp.status
-            if email and status in (401, 402, 403, 429) or (500 <= status < 600):
-                cfg = self.__class__.config
-                if email in cfg.get("accounts", {}):
-                    cfg["accounts"][email]["disabled"] = True
-                    save_config(cfg)
+            out_status, retry_secs = handle_upstream_status(email, status, self.__class__.config)
+            rewritten = out_status != status
+
+            if rewritten:
+                resp.read()
+                body_out = json.dumps({
+                    "error": {
+                        "message": "Account rate-limited or disabled, please retry",
+                        "type": "account_unavailable",
+                        "code": "account_unavailable",
+                    }
+                }, ensure_ascii=False).encode("utf-8")
+                self.send_response(out_status)
+                self.send_header("Content-Type", "application/json")
+                if retry_secs:
+                    self.send_header("Retry-After", str(retry_secs))
+                self._cors_headers()
+                self.send_header("Content-Length", str(len(body_out)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body_out)
+                except BrokenPipeError:
+                    pass
+                conn.close()
+                if api_key:
+                    key_manager.record_usage(api_key, 0, 1)
+                    call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
+                return
 
             self.send_response(resp.status)
             skip = {"set-auth-token", "connection", "keep-alive", "transfer-encoding"}
+            has_retry_after = False
             for key, val in resp.getheaders():
                 if key.lower() not in skip:
                     self.send_header(key, val)
+                    if key.lower() == "retry-after":
+                        has_retry_after = True
+            if status == 429 and not has_retry_after and retry_secs:
+                self.send_header("Retry-After", str(retry_secs))
             self._cors_headers()
             self.end_headers()
 
@@ -555,11 +640,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if resp.status == 200:
                     try:
                         d = json.loads(data.decode("utf-8", errors="replace"))
-                        if d.get("error"):
-                            cfg = self.__class__.config
-                            if email in cfg.get("accounts", {}):
-                                cfg["accounts"][email]["disabled"] = True
-                                save_config(cfg)
                         model = d.get("model", model)
                         u = d.get("usage", {})
                         i_tokens = u.get("prompt_tokens", 0)
@@ -570,8 +650,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             conn.close()
 
-            if tokens_used > 0:
-                usage_store.record_usage(tokens_used)
             if api_key and tokens_used > 0:
                 key_manager.record_usage(api_key, tokens_used)
                 call_log.record(model, email, i_tokens, o_tokens)
@@ -580,7 +658,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
 
         except Exception as e:
-            health_tracker.record_request(success=False)
             ts = time.strftime("%H:%M:%S")
             print(f"[{ts}] Upstream error for {email}: {e}")
             if not self.headers_sent:
@@ -641,7 +718,7 @@ def main():
     parser.add_argument("--delete-key", type=str, metavar="KEY", help="Delete an API key")
     parser.add_argument("--toggle-key", type=str, metavar="KEY", help="Toggle enable/disable for an API key")
     parser.add_argument("--strategy", type=str,
-                        choices=[STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN],
+                        choices=[STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST],
                         help=f"Account selection strategy (default: {STRATEGY_SPECIFIC})")
     args = parser.parse_args()
 

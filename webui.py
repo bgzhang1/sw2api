@@ -31,11 +31,10 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, Response
 import call_log
 import key_manager
-import health_tracker
-import usage_store
 from proxy import (
-    STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN,
+    STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST,
     select_account, get_account_state, AccountState,
+    handle_upstream_status, next_available_in,
 )
 
 app = Flask(__name__)
@@ -170,15 +169,6 @@ def start_token_refresh():
 
 # ─── Health / Dashboard ────────────────────────────────────────
 
-@app.route("/api/health/availability")
-def api_health_availability():
-    data = health_tracker.get_availability()
-    return jsonify({
-        "slots": data,
-        "summary": health_tracker.get_summary(),
-    })
-
-
 @app.route("/api/dashboard")
 def api_dashboard():
     cfg = load_config()
@@ -192,16 +182,17 @@ def api_dashboard():
     for email, acct in accounts:
         is_disabled = acct.get("disabled", False)
         if is_disabled:
-            account_details.append({"email": email, "disabled": True, "blocked": False, "quota": None})
+            account_details.append({"email": email, "disabled": True, "cooling": False, "cooldown_remaining": 0, "blocked": False, "quota": None})
         else:
-            account_details.append({"email": email, "disabled": False, "blocked": False, "quota": None})
+            state = get_account_state(email)
+            rem = int(state.cooldown_remaining()) if state else 0
+            account_details.append({"email": email, "disabled": False, "cooling": rem > 0, "cooldown_remaining": rem, "blocked": False, "quota": None})
 
-    available_count = sum(1 for d in account_details if not d.get("disabled"))
+    available_count = sum(1 for d in account_details if not d.get("disabled") and not d.get("cooling"))
+    cooling_count = sum(1 for d in account_details if d.get("cooling"))
     disabled_count = sum(1 for d in account_details if d.get("disabled"))
 
     return jsonify({
-        "availability": health_tracker.get_availability(),
-        "availabilitySummary": health_tracker.get_summary(),
         "proxy": {
             "running": proxy_state["running"],
             "port": proxy_state["port"],
@@ -210,6 +201,7 @@ def api_dashboard():
         "accounts": {
             "total": total_accounts,
             "available": available_count,
+            "cooling": cooling_count,
             "disabled": disabled_count,
             "details": account_details,
         },
@@ -233,8 +225,8 @@ def api_strategy_get():
 def api_strategy_set():
     cfg = load_config()
     strategy = request.json.get("strategy", "").strip()
-    if strategy not in (STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN):
-        return jsonify({"error": f"Invalid strategy. Choose from: {STRATEGY_SPECIFIC}, {STRATEGY_FILL_FIRST}, {STRATEGY_ROUND_ROBIN}"}), 400
+    if strategy not in (STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST):
+        return jsonify({"error": f"Invalid strategy. Choose from: {STRATEGY_SPECIFIC}, {STRATEGY_FILL_FIRST}"}), 400
     cfg["strategy"] = strategy
     save_config(cfg)
     return jsonify({"success": True, "strategy": strategy})
@@ -546,13 +538,14 @@ def _start_proxy_instance(port):
 
             email, acct, token = self._select_account()
             if not token:
+                retry = next_available_in(self.__class__.config)
                 self.send_response(429)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Retry-After", "30")
+                self.send_header("Retry-After", str(retry))
                 self._cors()
                 self.end_headers()
                 self.wfile.write(json.dumps({
-                    "error": {"code": "account_unavailable", "message": "All accounts are cooling down"}
+                    "error": {"code": "account_unavailable", "message": "All accounts are cooling down, retry later"}
                 }).encode())
                 return
 
@@ -596,7 +589,6 @@ def _start_proxy_instance(port):
             try:
                 conn.request(self.command, path, body=body, headers=uh)
                 resp = conn.getresponse()
-                health_tracker.record_request(success=200 <= resp.status < 400)
                 set_auth = resp.getheader("set-auth-token")
                 if set_auth and email:
                     cfg = self.__class__.config
@@ -604,16 +596,46 @@ def _start_proxy_instance(port):
                         cfg["accounts"][email]["token"] = set_auth
                         save_config(cfg)
                 status = resp.status
-                if email and (status in (401, 402, 403, 429) or (500 <= status < 600)):
-                    cfg = self.__class__.config
-                    if email in cfg.get("accounts", {}):
-                        cfg["accounts"][email]["disabled"] = True
-                        save_config(cfg)
+                out_status, retry_secs = handle_upstream_status(email, status, self.__class__.config)
+                rewritten = out_status != status
+
+                if rewritten:
+                    resp.read()
+                    body_out = json.dumps({
+                        "error": {
+                            "message": "Account rate-limited or disabled, please retry",
+                            "type": "account_unavailable",
+                            "code": "account_unavailable",
+                        }
+                    }, ensure_ascii=False).encode()
+                    self.send_response(out_status)
+                    self.send_header("Content-Type", "application/json")
+                    if retry_secs:
+                        self.send_header("Retry-After", str(retry_secs))
+                    self._cors()
+                    self.send_header("Content-Length", str(len(body_out)))
+                    self.end_headers()
+                    self._responded = True
+                    try:
+                        self.wfile.write(body_out)
+                    except BrokenPipeError:
+                        pass
+                    conn.close()
+                    if api_key:
+                        key_manager.record_usage(api_key, 0, 1)
+                        call_log.record(req_model if is_chat else model, email, 0, 0, "fail")
+                    return
+
                 self.send_response(resp.status)
                 skip = {"connection", "keep-alive", "transfer-encoding", "set-auth-token"}
+                has_retry_after = False
                 for k, v in resp.getheaders():
                     if k.lower() not in skip:
                         self.send_header(k, v)
+                        if k.lower() == "retry-after":
+                            has_retry_after = True
+                if status == 429 and not has_retry_after and retry_secs:
+                    self.send_header("Retry-After", str(retry_secs))
                 self._cors()
                 self.end_headers()
                 self._responded = True
@@ -652,11 +674,6 @@ def _start_proxy_instance(port):
                     if resp.status == 200:
                         try:
                             d = json.loads(data.decode("utf-8", errors="replace"))
-                            if d.get("error"):
-                                cfg = self.__class__.config
-                                if email in cfg.get("accounts", {}):
-                                    cfg["accounts"][email]["disabled"] = True
-                                    save_config(cfg)
                             model = d.get("model", model)
                             u = d.get("usage", {})
                             i_tokens = u.get("prompt_tokens", 0)
@@ -665,8 +682,6 @@ def _start_proxy_instance(port):
                         except Exception:
                             pass
                 conn.close()
-                if tokens_used > 0:
-                    usage_store.record_usage(tokens_used)
                 if api_key and tokens_used > 0:
                     key_manager.record_usage(api_key, tokens_used)
                     call_log.record(model, email, i_tokens, o_tokens)
@@ -674,7 +689,6 @@ def _start_proxy_instance(port):
                     key_manager.record_usage(api_key, 0, 1)
                     call_log.record(req_model if is_chat else model, email, 0, 0, "fail")
             except Exception as e:
-                health_tracker.record_request(success=False)
                 if not self._responded:
                     self.send_response(502)
                     self.send_header("Content-Type", "application/json")

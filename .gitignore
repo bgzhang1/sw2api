@@ -9,28 +9,7 @@ build/
 .venv/
 venv/
 
-# Debug / test / standalone tools
-debug_api.py
-debug_otp.py
-decrypt_session.py
-machine_id.py
-debug_mail.py
-TECHNICAL_DOC.md
-register.py
-retry.py
-retry_results.json
-system_prompt.txt
-
-# Generated registration results (contains emails)
-register_results.json
-retry2_results.json
-retry3_results.json
-
-# Retry scripts with hardcoded credentials
-retry2.py
-retry3.py
-
-# Sensitive data - credentials
+# Sensitive data - credentials & runtime state
 data/config.json
 data/api_keys.json
 data/usage_history.json
@@ -52,4 +31,3 @@ Thumbs.db
 # Environment
 .env
 .env.local
-sw2api/

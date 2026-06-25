@@ -64,12 +64,7 @@ tailwind.config = {
       <div id="dashAccounts"><span class="spinner"></span> Loading...</div>
     </div>
   </div>
-  <!-- Row 2: 24h availability -->
-  <div class="bg-white rounded-xl border border-slate-200 p-6 shadow-sm mb-5">
-    <h2 class="text-base font-semibold text-slate-900 mb-4">24h Availability (10min/cell)</h2>
-    <div id="dashAvailability" class="text-center"><span class="spinner"></span> Loading...</div>
-  </div>
-  <!-- Row 3: Recent Calls -->
+  <!-- Row 2: Recent Calls -->
   <div class="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
     <div class="flex items-center justify-between mb-4">
       <h2 class="text-base font-semibold text-slate-900">Recent Calls</h2>
@@ -122,13 +117,6 @@ tailwind.config = {
       </div>
       <div class="flex items-center gap-2 text-xs text-slate-500">
         <button class="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700" onclick="loadAccounts()">Refresh</button>
-        <span>Columns</span>
-        <select id="acctCols" class="rounded border border-slate-300 px-2 py-1 text-xs focus:ring-2 focus:ring-indigo-500 outline-none" onchange="renderAccounts(this.value)">
-          <option value="1">1</option>
-          <option value="2" selected>2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-        </select>
       </div>
     </div>
     <div id="accountsList"><span class="spinner"></span> Loading...</div>
@@ -227,7 +215,6 @@ tailwind.config = {
         <select id="proxyStrategy" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
           <option value="specific">指定单独账号 (Specific)</option>
           <option value="fill_first">填充 (Fill First)</option>
-          <option value="round_robin">轮询 (Round Robin)</option>
         </select>
         <button class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50" onclick="setStrategy()">Apply</button>
       </div>
@@ -385,14 +372,11 @@ async function refreshDashboard() {
 
   // ── Proxy info in accounts header ──
   const pxy = d.proxy || {};
-  const stratLabels = {specific:'指定账号', fill_first:'填充', round_robin:'轮询'};
+  const stratLabels = {specific:'指定账号', fill_first:'填充'};
   document.getElementById('dashProxyInfo').textContent = 'Proxy: ' + (pxy.running ? 'Running' : 'Stopped') + ' | ' + (stratLabels[pxy.strategy] || pxy.strategy) + ' | :' + (pxy.port || '-');
 
   // ── Account status card ──
   renderAccountStatus(d.accounts);
-
-  // ── 24h availability grid ──
-  renderAvailabilityGrid(d.availability);
 
   // ── Recent calls ──
   loadCallLog();
@@ -402,10 +386,9 @@ async function refreshAccounts() {
   const d = await api('/api/dashboard', {silent:true});
   if (!d) return;
   const pxy = d.proxy || {};
-  const stratLabels = {specific:'指定账号', fill_first:'填充', round_robin:'轮询'};
+  const stratLabels = {specific:'指定账号', fill_first:'填充'};
   document.getElementById('dashProxyInfo').textContent = 'Proxy: ' + (pxy.running ? 'Running' : 'Stopped') + ' | ' + (stratLabels[pxy.strategy] || pxy.strategy) + ' | :' + (pxy.port || '-');
   renderAccountStatus(d.accounts);
-  renderAvailabilityGrid(d.availability);
   loadCallLog();
 }
 
@@ -431,8 +414,9 @@ function renderAccountStatus(accts) {
 
   const avail = accts.available || 0;
   const dis = accts.disabled || 0;
+  const cool = accts.cooling || 0;
 
-  if ((avail + dis) === 0) {
+  if ((avail + dis + cool) === 0) {
     el.innerHTML = '<div class="text-slate-400 text-sm py-4">No accounts</div>';
     return;
   }
@@ -445,74 +429,31 @@ function renderAccountStatus(accts) {
         <div class="text-xs text-emerald-500 mt-1">Ready to serve</div>
       </div>
       <div class="bg-amber-50 rounded-xl p-5 text-center">
-        <div class="text-sm text-amber-600 font-medium">Cooldown</div>
-        <div class="text-3xl font-bold text-amber-700 mt-1">${dis}</div>
-        <div class="text-xs text-amber-500 mt-1">限额用尽/禁用</div>
+        <div class="text-sm text-amber-600 font-medium">Cooling</div>
+        <div class="text-3xl font-bold text-amber-700 mt-1">${cool}</div>
+        <div class="text-xs text-amber-500 mt-1">429/5xx 冷却中</div>
       </div>
       <div class="bg-red-50 rounded-xl p-5 text-center">
-        <div class="text-sm text-red-600 font-medium">Blocked</div>
-        <div class="text-3xl font-bold text-red-700 mt-1">0</div>
-        <div class="text-xs text-red-500 mt-1">403 封禁封号</div>
+        <div class="text-sm text-red-600 font-medium">Disabled</div>
+        <div class="text-3xl font-bold text-red-700 mt-1">${dis}</div>
+        <div class="text-xs text-red-500 mt-1">401/403 禁用</div>
       </div>
     </div>
     <div class="max-h-60 overflow-y-auto">${(accts.details||[]).map(a => {
       const emailEsc = a.email.replace(/'/g,"\\'");
-      const badge = a.disabled ? '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Cooldown</span>'
-        : '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Available</span>';
-      const act = a.disabled ? 'enable' : 'disable';
-      return '<div class="flex items-center gap-2 py-1.5 border-b border-slate-100 last:border-0"><span class="text-xs text-slate-600 truncate" title="'+escHtml(a.email)+'">'+escHtml(a.email.split('@')[0])+'</span>'+badge+'<button class="text-xs px-2 py-0.5 rounded '+ (a.disabled ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-slate-200 text-slate-600 hover:bg-slate-300') +' ml-auto shrink-0" onclick="toggleAccount(\''+emailEsc+'\',\''+act+'\')">'+ (a.disabled ? 'Enable' : 'Disable') +'</button></div>';
-    }).join('')}</div>`;
-}
-
-function renderAvailabilityGrid(slots) {
-  const el = document.getElementById('dashAvailability');
-  if (!slots || slots.length === 0) {
-    el.innerHTML = '<div class="text-slate-400 text-sm py-4">No availability data</div>';
-    return;
-  }
-
-  // 6 rows x 24 cols = 144 cells
-  // Row = 4-hour block, Col = 10-min slot within block
-  let grid = '';
-  const rowLabels = ['00:00','04:00','08:00','12:00','16:00','20:00'];
-  const now = Date.now();
-
-  for (let r = 0; r < 6; r++) {
-    grid += '<div class="flex items-center gap-1.5">';
-    grid += `<div class="text-[11px] text-slate-400 w-12 shrink-0 text-right pr-1.5 font-medium">${rowLabels[r]}</div>`;
-    for (let c = 0; c < 24; c++) {
-      const idx = r * 24 + c;
-      if (idx >= slots.length) break;
-      const s = slots[idx];
-      let bg = '#e2e8f0';
-      let title = 'No data';
-      if (s.availability !== null && s.availability !== undefined) {
-        const pct = s.availability;
-        if (pct >= 100) bg = '#22c55e';
-        else if (pct >= 95) bg = '#86efac';
-        else if (pct >= 50) bg = '#eab308';
-        else bg = '#ef4444';
-        title = pct.toFixed(0) + '% (' + s.success + '/' + s.total + ')';
+      let badge, act, btnCls, btnTxt;
+      if (a.disabled) {
+        badge = '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-red-100 text-red-700">Disabled</span>';
+        act = 'enable'; btnCls = 'bg-emerald-600 text-white hover:bg-emerald-700'; btnTxt = 'Enable';
+      } else if (a.cooling) {
+        badge = '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-amber-100 text-amber-700">Cooling '+a.cooldown_remaining+'s</span>';
+        act = 'disable'; btnCls = 'bg-slate-200 text-slate-600 hover:bg-slate-300'; btnTxt = 'Disable';
+      } else {
+        badge = '<span class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700">Available</span>';
+        act = 'disable'; btnCls = 'bg-slate-200 text-slate-600 hover:bg-slate-300'; btnTxt = 'Disable';
       }
-      const st = new Date(s.slot_start_ts * 1000);
-      const et = new Date(s.slot_end_ts * 1000);
-      const timeStr = st.toTimeString().slice(0,5) + ' - ' + et.toTimeString().slice(0,5);
-      grid += `<div class="w-4 h-4 rounded-sm cursor-help shrink-0 border border-slate-100" style="background:${bg}" title="${timeStr} | ${title}"></div>`;
-    }
-    grid += '</div>';
-  }
-
-  // Color legend
-  grid += `<div class="flex items-center gap-4 mt-3 text-xs text-slate-500">
-    <span class="font-medium">Legend:</span>
-    <span class="flex items-center gap-1.5"><span class="w-4 h-4 rounded-sm border border-slate-100" style="background:#22c55e"></span>100%</span>
-    <span class="flex items-center gap-1.5"><span class="w-4 h-4 rounded-sm border border-slate-100" style="background:#86efac"></span>95-99%</span>
-    <span class="flex items-center gap-1.5"><span class="w-4 h-4 rounded-sm border border-slate-100" style="background:#eab308"></span>50-94%</span>
-    <span class="flex items-center gap-1.5"><span class="w-4 h-4 rounded-sm border border-slate-100" style="background:#ef4444"></span>0-49%</span>
-    <span class="flex items-center gap-1.5"><span class="w-4 h-4 rounded-sm border border-slate-100" style="background:#e2e8f0"></span>No request</span>
-  </div>`;
-
-  el.innerHTML = grid;
+      return '<div class="flex items-center gap-2 py-1.5 border-b border-slate-100 last:border-0"><span class="text-xs text-slate-600 truncate" title="'+escHtml(a.email)+'">'+escHtml(a.email.split('@')[0])+'</span>'+badge+'<button class="text-xs px-2 py-0.5 rounded '+btnCls+' ml-auto shrink-0" onclick="toggleAccount(\''+emailEsc+'\',\''+act+'\')">'+btnTxt+'</button></div>';
+    }).join('')}</div>`;
 }
 
 // ─── Login ───
@@ -551,30 +492,37 @@ async function logout() {
 
 // ─── Accounts ───
 let _accountsData = null;
+let _acctPage = 1;
+const ACCT_PAGE_SIZE = 6;
+const ACCT_COLS = 3;
 
 async function loadAccounts(silent) {
   const r = await api('/api/accounts', {silent:true});
   if (!r) { document.getElementById('accountsList').innerHTML = '<span class="text-red-600 text-sm">Failed to load accounts</span>'; return; }
   _accountsData = r.accounts || [];
-  const cols = document.getElementById('acctCols')?.value || 2;
-  renderAccounts(cols);
+  const maxPage = Math.max(1, Math.ceil(_accountsData.length / ACCT_PAGE_SIZE));
+  if (_acctPage > maxPage) _acctPage = maxPage;
+  renderAccounts();
   if (!silent) {
-    const rr = await api('/api/accounts/refresh-usage', {method:'POST', silent:true});
-    if (rr) {
-      const msg = rr.enabled > 0 ? `Refreshed ${r.accounts.length} accounts, re-enabled ${rr.enabled}` : `Refreshed ${r.accounts.length} accounts`;
-      toast(msg, 'success');
-      refreshAccounts();
-    }
+    toast(`Refreshed page ${_acctPage}`, 'success');
+    refreshAccounts();
   }
 }
 
-function renderAccounts(cols) {
+function renderAccounts() {
   const el = document.getElementById('accountsList');
   if (!_accountsData || _accountsData.length === 0) {
     el.innerHTML = '<div class="text-slate-500 text-sm">No accounts. Login first or use Decrypt to add one.</div>';
     return;
   }
-  const cardHtml = _accountsData.map(acct => {
+  const total = _accountsData.length;
+  const maxPage = Math.max(1, Math.ceil(total / ACCT_PAGE_SIZE));
+  if (_acctPage > maxPage) _acctPage = maxPage;
+  if (_acctPage < 1) _acctPage = 1;
+  const start = (_acctPage - 1) * ACCT_PAGE_SIZE;
+  const pageItems = _accountsData.slice(start, start + ACCT_PAGE_SIZE);
+
+  const cardHtml = pageItems.map(acct => {
     const isActive = acct.active;
     let infoHtml = '';
     if (acct.usage) {
@@ -616,7 +564,21 @@ function renderAccounts(cols) {
       <div class="flex-1">${infoHtml}</div>
     </div>`;
   }).join('');
-  el.innerHTML = `<div class="grid gap-3" style="grid-template-columns:repeat(${cols},minmax(0,1fr))">${cardHtml}</div>`;
+
+  const pagerHtml = `<div class="flex items-center justify-between mt-4">
+    <span class="text-xs text-slate-500">Page ${_acctPage} / ${maxPage} (${total} accounts)</span>
+    <div class="flex gap-2">
+      <button class="px-3 py-1 text-xs font-medium rounded-lg ${_acctPage<=1?'bg-slate-100 text-slate-300':'bg-slate-200 text-slate-600 hover:bg-slate-300'}" ${_acctPage<=1?'disabled':''} onclick="goAcctPage(${_acctPage-1})">Prev</button>
+      <button class="px-3 py-1 text-xs font-medium rounded-lg ${_acctPage>=maxPage?'bg-slate-100 text-slate-300':'bg-slate-200 text-slate-600 hover:bg-slate-300'}" ${_acctPage>=maxPage?'disabled':''} onclick="goAcctPage(${_acctPage+1})">Next</button>
+    </div>
+  </div>`;
+
+  el.innerHTML = `<div class="grid gap-3" style="grid-template-columns:repeat(${ACCT_COLS},minmax(0,1fr))">${cardHtml}</div>${pagerHtml}`;
+}
+
+function goAcctPage(p) {
+  _acctPage = p;
+  renderAccounts();
 }
 
 async function switchAccount(email) {
