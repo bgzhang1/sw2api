@@ -451,6 +451,198 @@ def api_test_endpoint():
 
 
 @app.route("/api/proxy/start", methods=["POST"])
+def _start_proxy_instance(port):
+    """Start the proxy HTTPServer in the current thread. Blocks until server stops."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse
+
+    _cfg = load_config()
+    _cfg["port"] = port
+
+    class Handler(BaseHTTPRequestHandler):
+        config = _cfg
+
+        def log_message(self, format, *args):
+            pass
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
+        def do_GET(self):
+            self._proxy()
+
+        def do_POST(self):
+            self._proxy()
+
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-stainless-*, X-Account-Email")
+
+        def _select_account(self):
+            cfg = self.__class__.config
+            strategy = cfg.get("strategy", STRATEGY_SPECIFIC)
+            specific_email = None
+            if strategy == STRATEGY_SPECIFIC:
+                specific_email = self.headers.get("X-Account-Email") or cfg.get("activeAccount")
+            email, acct = select_account(cfg, strategy, specific_email)
+            if email and acct:
+                return email, acct, acct.get("token")
+            return None, None, None
+
+        def _proxy(self):
+            cl = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(cl) if cl > 0 else b""
+
+            is_chat = "/chat/completions" in self.path
+            api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
+            if is_chat or api_key:
+                if not api_key:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self._cors()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "API key required. Create one in the WebUI.", "type": "auth_error"}).encode())
+                    return
+                k = key_manager.validate_key(api_key)
+                if k is None:
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self._cors()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Invalid or rate-limited API key", "type": "auth_error"}).encode())
+                    return
+
+            email, acct, token = self._select_account()
+            if not token:
+                self.send_response(429)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "30")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": {"code": "account_unavailable", "message": "All accounts are cooling down"}
+                }).encode())
+                return
+
+            target = urlparse(f"https://{API_HOST}")
+            conn = HTTPSConnection(target.hostname, target.port or 443, timeout=120)
+            path = self.path
+            if is_chat:
+                path = path.replace("/v1/chat/completions", "/v1/ai/chat/completions")
+                uh = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": "ai-sdk/openai-compatible/2.0.47 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
+                    "X-Stagewise-Client": "electron/1.11.0",
+                    "Host": target.hostname,
+                }
+                if body:
+                    try:
+                        req = json.loads(body.decode("utf-8"))
+                        req.setdefault("reasoning", {"enabled": True, "effort": "low"})
+                        req.setdefault("provider", {"require_parameters": True})
+                        has_system = any(m.get("role") == "system" for m in req.get("messages", []))
+                        if not has_system:
+                            try:
+                                sp = Path("C:/Desktop/system_prompt.txt").read_text("utf-8")
+                                req.setdefault("messages", []).insert(0, {"role": "system", "content": sp})
+                            except Exception:
+                                pass
+                        body = json.dumps(req, ensure_ascii=False).encode("utf-8")
+                    except Exception:
+                        pass
+                if body:
+                    uh["Content-Length"] = str(len(body))
+            else:
+                uh = {}
+                for k, v in self.headers.items():
+                    if k.lower() not in ("host", "connection", "proxy-connection", "keep-alive", "transfer-encoding"):
+                        uh[k] = v
+                uh["Authorization"] = f"Bearer {token}"
+                uh["Host"] = target.hostname
+                if body:
+                    uh["Content-Length"] = str(len(body))
+                    if "Content-Type" not in uh:
+                        uh["Content-Type"] = "application/json"
+            try:
+                conn.request(self.command, path, body=body, headers=uh)
+                resp = conn.getresponse()
+                health_tracker.record_request(success=200 <= resp.status < 400)
+                set_auth = resp.getheader("set-auth-token")
+                if set_auth and email:
+                    cfg = self.__class__.config
+                    if email in cfg.get("accounts", {}):
+                        cfg["accounts"][email]["token"] = set_auth
+                        save_config(cfg)
+                status = resp.status
+                if email and (status in (401, 403, 429) or (500 <= status < 600)):
+                    get_account_state(email).apply_cooldown(status)
+                self.send_response(resp.status)
+                skip = {"connection", "keep-alive", "transfer-encoding", "set-auth-token"}
+                for k, v in resp.getheaders():
+                    if k.lower() not in skip:
+                        self.send_header(k, v)
+                self._cors()
+                self.end_headers()
+                ct = resp.getheader("content-type", "")
+                tokens_used = 0
+                if "text/event-stream" in ct:
+                    last_chunk = None
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            last_chunk = chunk
+                        except BrokenPipeError:
+                            break
+                    if api_key and last_chunk:
+                        for line in last_chunk.decode("utf-8", errors="replace").split("\n"):
+                            if line.startswith("data: ") and "[DONE]" not in line:
+                                try:
+                                    d = json.loads(line[6:])
+                                    tokens_used = d.get("usage", {}).get("total_tokens", 0)
+                                except Exception:
+                                    pass
+                else:
+                    data = resp.read()
+                    self.wfile.write(data)
+                    if api_key and resp.status == 200:
+                        try:
+                            d = json.loads(data.decode("utf-8", errors="replace"))
+                            tokens_used = d.get("usage", {}).get("total_tokens", 0)
+                        except Exception:
+                            pass
+                conn.close()
+                if tokens_used > 0:
+                    usage_store.record_usage(tokens_used)
+                if api_key and tokens_used > 0:
+                    key_manager.record_usage(api_key, tokens_used)
+                elif api_key:
+                    key_manager.record_usage(api_key, 0, 1)
+            except Exception as e:
+                health_tracker.record_request(success=False)
+                if not self.headers_sent:
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self._cors()
+                    self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
+
+    try:
+        server = HTTPServer(("0.0.0.0", port), Handler)
+        proxy_state["server"] = server
+        server.serve_forever()
+    except Exception:
+        proxy_state["running"] = False
+
+
 def api_proxy_start():
     if proxy_state["running"]:
         return jsonify({"error": "Proxy already running"}), 400
@@ -461,195 +653,7 @@ def api_proxy_start():
     proxy_state["port"] = port
     proxy_state["running"] = True
 
-    def run_proxy():
-        from http.server import HTTPServer, BaseHTTPRequestHandler
-        from urllib.parse import urlparse
-
-        # Load full config for strategy-based selection
-        _cfg = load_config()
-        _cfg["port"] = port
-
-        class Handler(BaseHTTPRequestHandler):
-            config = _cfg
-
-            def log_message(self, format, *args):
-                pass
-
-            def do_OPTIONS(self):
-                self.send_response(204)
-                self._cors()
-                self.end_headers()
-
-            def do_GET(self):
-                self._proxy()
-
-            def do_POST(self):
-                self._proxy()
-
-            def _cors(self):
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-stainless-*, X-Account-Email")
-
-            def _select_account(self):
-                cfg = self.__class__.config
-                strategy = cfg.get("strategy", STRATEGY_SPECIFIC)
-                specific_email = None
-                if strategy == STRATEGY_SPECIFIC:
-                    specific_email = self.headers.get("X-Account-Email") or cfg.get("activeAccount")
-                email, acct = select_account(cfg, strategy, specific_email)
-                if email and acct:
-                    return email, acct, acct.get("token")
-                return None, None, None
-
-            def _proxy(self):
-                cl = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(cl) if cl > 0 else b""
-
-                api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
-                if api_key:
-                    k = key_manager.validate_key(api_key)
-                    if k is None:
-                        self.send_response(401)
-                        self.send_header("Content-Type", "application/json")
-                        self._cors()
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "Invalid or rate-limited API key", "type": "auth_error"}).encode())
-                        return
-
-                email, acct, token = self._select_account()
-                if not token:
-                    self.send_response(429)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Retry-After", "30")
-                    self._cors()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
-                        "error": {"code": "account_unavailable", "message": "All accounts are cooling down"}
-                    }).encode())
-                    return
-
-                target = urlparse(f"https://{API_HOST}")
-                conn = HTTPSConnection(target.hostname, target.port or 443, timeout=120)
-                path = self.path
-                is_chat = "/chat/completions" in path
-                if is_chat:
-                    path = path.replace("/v1/chat/completions", "/v1/ai/chat/completions")
-                    uh = {
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "User-Agent": "ai-sdk/openai-compatible/2.0.47 ai-sdk/provider-utils/4.0.27 runtime/node.js/24",
-                        "X-Stagewise-Client": "electron/1.11.0",
-                        "Host": target.hostname,
-                    }
-                    if body:
-                        try:
-                            req = json.loads(body.decode("utf-8"))
-                            req.setdefault("reasoning", {"enabled": True, "effort": "low"})
-                            req.setdefault("provider", {"require_parameters": True})
-                            has_system = any(m.get("role") == "system" for m in req.get("messages", []))
-                            if not has_system:
-                                try:
-                                    sp = Path("C:/Desktop/system_prompt.txt").read_text("utf-8")
-                                    req.setdefault("messages", []).insert(0, {"role": "system", "content": sp})
-                                except Exception:
-                                    pass
-                            body = json.dumps(req, ensure_ascii=False).encode("utf-8")
-                        except Exception:
-                            pass
-                    if body:
-                        uh["Content-Length"] = str(len(body))
-                else:
-                    uh = {}
-                    for k, v in self.headers.items():
-                        if k.lower() not in ("host", "connection", "proxy-connection", "keep-alive", "transfer-encoding"):
-                            uh[k] = v
-                    uh["Authorization"] = f"Bearer {token}"
-                    uh["Host"] = target.hostname
-                    if body:
-                        uh["Content-Length"] = str(len(body))
-                        if "Content-Type" not in uh:
-                            uh["Content-Type"] = "application/json"
-                try:
-                    conn.request(self.command, path, body=body, headers=uh)
-                    resp = conn.getresponse()
-
-                    health_tracker.record_request(success=200 <= resp.status < 400)
-
-                    set_auth = resp.getheader("set-auth-token")
-                    if set_auth and email:
-                        cfg = self.__class__.config
-                        if email in cfg.get("accounts", {}):
-                            cfg["accounts"][email]["token"] = set_auth
-                            save_config(cfg)
-
-                    status = resp.status
-                    if email and (status in (401, 403, 429) or (500 <= status < 600)):
-                        get_account_state(email).apply_cooldown(status)
-
-                    self.send_response(resp.status)
-                    skip = {"connection", "keep-alive", "transfer-encoding", "set-auth-token"}
-                    for k, v in resp.getheaders():
-                        if k.lower() not in skip:
-                            self.send_header(k, v)
-                    self._cors()
-                    self.end_headers()
-                    ct = resp.getheader("content-type", "")
-                    tokens_used = 0
-                    if "text/event-stream" in ct:
-                        last_chunk = None
-                        while True:
-                            chunk = resp.read(4096)
-                            if not chunk:
-                                break
-                            try:
-                                self.wfile.write(chunk)
-                                self.wfile.flush()
-                                last_chunk = chunk
-                            except BrokenPipeError:
-                                break
-                        if api_key and last_chunk:
-                            for line in last_chunk.decode("utf-8", errors="replace").split("\n"):
-                                if line.startswith("data: ") and "[DONE]" not in line:
-                                    try:
-                                        d = json.loads(line[6:])
-                                        tokens_used = d.get("usage", {}).get("total_tokens", 0)
-                                    except Exception:
-                                        pass
-                    else:
-                        data = resp.read()
-                        self.wfile.write(data)
-                        if api_key and resp.status == 200:
-                            try:
-                                d = json.loads(data.decode("utf-8", errors="replace"))
-                                tokens_used = d.get("usage", {}).get("total_tokens", 0)
-                            except Exception:
-                                pass
-                    conn.close()
-                    if tokens_used > 0:
-                        usage_store.record_usage(tokens_used)
-                    if api_key and tokens_used > 0:
-                        key_manager.record_usage(api_key, tokens_used)
-                    elif api_key:
-                        key_manager.record_usage(api_key, 0, 1)
-                except Exception as e:
-                    health_tracker.record_request(success=False)
-                    if not self.headers_sent:
-                        self.send_response(502)
-                        self.send_header("Content-Type", "application/json")
-                        self._cors()
-                        self.end_headers()
-                    self.wfile.write(json.dumps({"error": str(e)}).encode())
-
-        try:
-            server = HTTPServer(("0.0.0.0", port), Handler)
-            proxy_state["server"] = server
-            server.serve_forever()
-        except Exception:
-            proxy_state["running"] = False
-
-    t = threading.Thread(target=run_proxy, daemon=True)
+    t = threading.Thread(target=lambda: _start_proxy_instance(port), daemon=True)
     t.start()
     proxy_state["thread"] = t
     return jsonify({"success": True, "port": port})
@@ -868,9 +872,9 @@ def api_keys_create():
         return jsonify({"error": "Name required"}), 400
     monthly_tokens = request.json.get("monthly_tokens")
     monthly_requests = request.json.get("monthly_requests")
-    key = key_manager.create_key(name, monthly_tokens, monthly_requests)
+    key, key_id = key_manager.create_key(name, monthly_tokens, monthly_requests)
     return jsonify({
-        "success": True, "key": key, "keyPreview": key[:20] + "...", "name": name,
+        "success": True, "key": key, "key_id": key_id, "keyPreview": key[:20] + "...", "name": name,
         "monthly_tokens": monthly_tokens or key_manager.DEFAULT_MONTHLY_TOKENS,
         "monthly_requests": monthly_requests or key_manager.DEFAULT_MONTHLY_REQUESTS,
     })
@@ -878,20 +882,20 @@ def api_keys_create():
 
 @app.route("/api/keys/delete", methods=["POST"])
 def api_keys_delete():
-    key = request.json.get("key", "").strip()
-    if not key:
-        return jsonify({"error": "Key required"}), 400
-    if key_manager.delete_key(key):
+    key_id = request.json.get("key_id", "").strip()
+    if not key_id:
+        return jsonify({"error": "key_id required"}), 400
+    if key_manager.delete_key(key_id):
         return jsonify({"success": True})
     return jsonify({"error": "Key not found"}), 404
 
 
 @app.route("/api/keys/toggle", methods=["POST"])
 def api_keys_toggle():
-    key = request.json.get("key", "").strip()
-    if not key:
-        return jsonify({"error": "Key required"}), 400
-    if key_manager.toggle_key(key):
+    key_id = request.json.get("key_id", "").strip()
+    if not key_id:
+        return jsonify({"error": "key_id required"}), 400
+    if key_manager.toggle_key(key_id):
         return jsonify({"success": True})
     return jsonify({"error": "Key not found"}), 404
 
@@ -907,10 +911,26 @@ def main():
         print("WARNING: Debug mode enables reloader. Token refresh runs separately.")
     start_token_refresh()
 
+    # Auto-start proxy
+    cfg = load_config()
+    proxy_port = cfg.get("port", 11434)
+    if cfg.get("accounts"):
+        import threading, time
+        def auto_start():
+            time.sleep(0.5)
+            from http.server import HTTPServer
+            from http.server import BaseHTTPRequestHandler
+            _start_proxy_instance(proxy_port)
+        t = threading.Thread(target=auto_start, daemon=True)
+        t.start()
+    else:
+        print("-> No accounts. Proxy not started. Login at /login to add accounts.")
+
     print()
     print("=" * 50)
     print("   stagewise WebUI - Multi-Account")
     print(f"   http://localhost:{args.port}")
+    print(f"   Proxy:    http://localhost:{proxy_port}/v1")
     print("=" * 50)
     print()
     app.run(host=args.host, port=args.port, debug=args.debug)

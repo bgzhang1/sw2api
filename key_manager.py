@@ -35,8 +35,10 @@ def create_key(name, monthly_tokens=None, monthly_requests=None):
     data = _load()
     raw = secrets.token_hex(24)
     key = f"{KEY_PREFIX}{raw}"
+    key_id = secrets.token_hex(8)
     now = _now()
     data["keys"][key] = {
+        "key_id": key_id,
         "name": name,
         "created_at": now,
         "enabled": True,
@@ -51,26 +53,40 @@ def create_key(name, monthly_tokens=None, monthly_requests=None):
         },
     }
     _save(data)
-    return key
+    return key, key_id
 
 
-def delete_key(key):
+def _resolve_key(data, key_or_id):
+    """Resolve a full key or key_id to (full_key, info)."""
+    # Try exact full key match first
+    if key_or_id in data["keys"]:
+        return key_or_id, data["keys"][key_or_id]
+    # Try key_id match
+    for full_key, info in data["keys"].items():
+        if info.get("key_id") == key_or_id:
+            return full_key, info
+    return None, None
+
+
+def delete_key(key_or_id):
     data = _load()
-    result = data["keys"].pop(key, None)
-    if result is not None:
-        _save(data)
-    return result is not None
+    full_key, _ = _resolve_key(data, key_or_id)
+    if full_key is None:
+        return False
+    del data["keys"][full_key]
+    _save(data)
+    return True
 
 
-def toggle_key(key, enabled=None):
+def toggle_key(key_or_id, enabled=None):
     data = _load()
-    k = data["keys"].get(key)
-    if k is None:
+    full_key, info = _resolve_key(data, key_or_id)
+    if info is None:
         return False
     if enabled is not None:
-        k["enabled"] = enabled
+        info["enabled"] = enabled
     else:
-        k["enabled"] = not k["enabled"]
+        info["enabled"] = not info["enabled"]
     _save(data)
     return True
 
@@ -88,8 +104,8 @@ def list_keys():
         token_pct = round(u["month_tokens"] / info["monthly_token_limit"] * 100, 2) if info["monthly_token_limit"] else 0
         req_pct = round(u["month_requests"] / info["monthly_request_limit"] * 100, 2) if info["monthly_request_limit"] else 0
         result.append({
-            "key": key,
-            "keyPreview": key[:20] + "...",
+            "key_id": info.get("key_id", ""),
+            "keyPreview": key[:8] + "..." + key[-8:],
             "name": info["name"],
             "created_at": info["created_at"],
             "enabled": info["enabled"],

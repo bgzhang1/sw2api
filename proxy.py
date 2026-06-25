@@ -443,8 +443,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
+        is_chat = "/chat/completions" in self.path
         api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
-        if api_key:
+        if is_chat or api_key:
+            if not api_key:
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self._cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "error": {"message": "API key required. Create one in the WebUI or use --create-key.", "type": "auth_error"}
+                }).encode("utf-8"))
+                return
             k = key_manager.validate_key(api_key)
             if k is None:
                 self.send_response(401)
@@ -477,7 +487,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         conn = HTTPSConnection(target.hostname, target.port or 443, timeout=120)
 
         path = self.path
-        is_chat = "/chat/completions" in path
 
         if is_chat:
             path = path.replace("/v1/chat/completions", "/v1/ai/chat/completions")
@@ -662,9 +671,11 @@ def main():
     args = parser.parse_args()
 
     if args.create_key:
-        key = key_manager.create_key(args.create_key)
-        print(f"OK Created API key: {key}")
+        key, key_id = key_manager.create_key(args.create_key)
+        print(f"OK Created API key:")
         print(f"    Name: {args.create_key}")
+        print(f"    Key:  {key}")
+        print(f"    !!! SAVE THIS KEY NOW - it will not be shown again !!!")
         return
 
     if args.list_keys:
@@ -688,11 +699,7 @@ def main():
 
     if args.toggle_key:
         if key_manager.toggle_key(args.toggle_key):
-            keys = key_manager.list_keys()
-            for k in keys:
-                if k["key"] == args.toggle_key:
-                    print(f"OK Key is now {'enabled' if k['enabled'] else 'disabled'}: {args.toggle_key[:30]}...")
-                    break
+            print(f"OK Key toggled: {args.toggle_key[:30]}...")
         else:
             print(f"X Key not found: {args.toggle_key[:30]}...")
         return

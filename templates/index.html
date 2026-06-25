@@ -822,8 +822,8 @@ async function loadApiKeys() {
       <div class="flex items-center gap-2 mb-3">
         <span class="font-semibold text-slate-900 flex-1">${escHtml(k.name)}</span>
         <span class="text-xs font-medium px-2 py-0.5 rounded-full ${isEnabled?'bg-emerald-100 text-emerald-700':'bg-red-100 text-red-700'}">${isEnabled?'Active':'Disabled'}</span>
-        <button class="px-2.5 py-1 text-xs font-medium bg-slate-200 text-slate-700 rounded-lg hover:bg-slate-300" onclick="toggleApiKey('${k.key}')">${isEnabled?'Disable':'Enable'}</button>
-        <button class="px-2.5 py-1 text-xs font-medium bg-red-600 text-white rounded-lg hover:bg-red-700" onclick="deleteApiKey('${k.key}')">Delete</button>
+        <button class="px-2.5 py-1 text-xs font-medium bg-slate-200 text-slate-700 rounded-lg hover:bg-slate-300" onclick="toggleApiKey('${k.key_id}')">${isEnabled?'Disable':'Enable'}</button>
+        <button class="px-2.5 py-1 text-xs font-medium bg-red-600 text-white rounded-lg hover:bg-red-700" onclick="deleteApiKey('${k.key_id}')">Delete</button>
       </div>
       <div class="text-xs text-slate-500 font-mono mb-3">${k.keyPreview}</div>
       <div class="text-xs text-slate-500 mb-1">Tokens: ${k.month_tokens.toLocaleString()} / ${k.monthly_token_limit.toLocaleString()} (${k.token_usage_pct}%)</div>
@@ -843,20 +843,33 @@ async function createApiKey() {
   const monthly_requests = parseInt(document.getElementById('apikeyReqLimit').value) || undefined;
   const r = await api('/api/keys/create', {body:{name, monthly_tokens, monthly_requests}});
   if (r && r.success) {
-    toast('Created: ' + r.key, 'success');
     document.getElementById('apikeyName').value = '';
     loadApiKeys();
+    // Show full key once with save warning
+    const overlay = document.createElement('div');
+    overlay.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
+    overlay.innerHTML = `<div class="bg-white rounded-xl shadow-2xl p-6 max-w-lg w-full mx-4">
+      <div class="text-base font-bold text-slate-900 mb-2">API Key Created</div>
+      <div class="text-sm text-slate-600 mb-4">Save this key now. It will <strong>never</strong> be shown again.</div>
+      <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4">
+        <div class="text-xs text-amber-700 font-medium mb-1">Key (click to copy)</div>
+        <div class="text-sm font-mono text-slate-900 break-all select-all cursor-pointer" onclick="navigator.clipboard.writeText(this.textContent); toast('Copied!','success')">${escHtml(r.key)}</div>
+      </div>
+      <div class="text-xs text-slate-400">Name: ${escHtml(r.name)}</div>
+      <button class="mt-4 w-full px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700" onclick="this.closest('.fixed').remove()">I've Saved It</button>
+    </div>`;
+    document.body.appendChild(overlay);
   }
 }
 
-async function deleteApiKey(key) {
+async function deleteApiKey(keyId) {
   if (!confirm('Delete this API key? This cannot be undone.')) return;
-  const r = await api('/api/keys/delete', {body:{key}});
+  const r = await api('/api/keys/delete', {body:{key_id: keyId}});
   if (r && r.success) { toast('Deleted','info'); loadApiKeys(); }
 }
 
-async function toggleApiKey(key) {
-  const r = await api('/api/keys/toggle', {body:{key}});
+async function toggleApiKey(keyId) {
+  const r = await api('/api/keys/toggle', {body:{key_id: keyId}});
   if (r && r.success) { loadApiKeys(); }
 }
 
