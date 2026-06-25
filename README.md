@@ -20,7 +20,7 @@ stagewise 多账号反向代理 + Web 管理面板。支持指定单独账号、
 
 ```bash
 # 安装依赖
-pip install flask cryptography
+pip install -r requirements.txt
 
 # 登录
 python webui.py
