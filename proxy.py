@@ -463,8 +463,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "error": {"message": "API key required. Create one in the WebUI or use --create-key.", "type": "auth_error"}
                 }).encode("utf-8"))
                 return
-            k = key_manager.validate_key(api_key)
-            if k is None:
+            if api_key:
+                k = key_manager.validate_key(api_key)
+                if k is None:
                 self.send_response(401)
                 self.send_header("Content-Type", "application/json")
                 self._cors_headers()

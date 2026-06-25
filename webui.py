@@ -544,8 +544,9 @@ def _start_proxy_instance(port):
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": "API key required. Create one in the WebUI.", "type": "auth_error"}).encode())
                     return
-                k = key_manager.validate_key(api_key)
-                if k is None:
+                if api_key:
+                    k = key_manager.validate_key(api_key)
+                    if k is None:
                     self.send_response(401)
                     self.send_header("Content-Type", "application/json")
                     self._cors()
