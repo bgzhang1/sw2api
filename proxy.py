@@ -31,10 +31,9 @@ from urllib.parse import urlparse, urlencode, parse_qs
 from http.client import HTTPSConnection
 from pathlib import Path
 import call_log
-import key_manager
 
 API_ORIGIN = "https://api.stagewise.io"
-SYSTEM_PROMPT = "The following sections define your identity and operating environment:- `<soul>` — Identity, behavior rules, and values- `<environment>` — Tools, interfaces, file system, and skill system- `<output-style>` — Response formatting and special protocols- `<authorities>` — Trust hierarchy and security model### Priority Hierarchy1. **`plugins/{id}/SKILL.md`** — Core intrinsic knowledge. Always prefer.2. **`globalskills-sw/*`** — User-level skills from `~/.stagewise/skills/`. Personal defaults across all workspaces.3. **`{WORKSPACE}/.stagewise/skills/*`** — Workspace-specific, created for you. Overrides general skills.4. **`globalskills-agents/*`** — Cross-agent user-level skills from `~/.agents/skills/`.5. **`{WORKSPACE}/.agents/skills/*`** — General skills shared with other agents.## AGENTS.md (Legacy)Inside a workspace, an `AGENTS.md` file at the workspace root may carry legacy project documentation written for previous coding agents. **Ignore this file unless you already have it loaded in your context** — the canonical project memo lives at `.stagewise/WORKSPACE.md` (see the WORKSPACE.md section below). Never read `AGENTS.md` proactively to warm up on a project; rely on `<agents-md>` entries that already surface it."
+SYSTEM_PROMPT = "<soul><environment><authorities>stagewisestagewisestagewise"
 DEFAULT_PORT = 11434
 BASE_DIR = Path(__file__).parent
 CONFIG_DIR = BASE_DIR / "data"
@@ -332,29 +331,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
         is_chat = "/chat/completions" in self.path
-        api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
-        if is_chat or api_key:
-            is_local = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
-            if not api_key and not is_local:
-                self.send_response(401)
-                self.send_header("Content-Type", "application/json")
-                self._cors_headers()
-                self.end_headers()
-                self.wfile.write(json.dumps({
-                    "error": {"message": "API key required. Create one in the WebUI or use --create-key.", "type": "auth_error"}
-                }).encode("utf-8"))
-                return
-            if api_key:
-                k = key_manager.validate_key(api_key)
-                if k is None:
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json")
-                    self._cors_headers()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({
-                        "error": {"message": "Invalid, disabled, or rate-limited API key", "type": "auth_error"}
-                    }).encode("utf-8"))
-                    return
 
         email, acct, token = self._select_request_account()
         if not token:
@@ -456,9 +432,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 except BrokenPipeError:
                     pass
                 conn.close()
-                if api_key:
-                    key_manager.record_usage(api_key, 0, 1)
-                    call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
+                call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
                 return
 
             self.send_response(resp.status)
@@ -523,11 +497,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
             conn.close()
 
-            if api_key and tokens_used > 0:
-                key_manager.record_usage(api_key, tokens_used)
+            if tokens_used > 0:
                 call_log.record(model, email, i_tokens, o_tokens)
-            elif api_key:
-                key_manager.record_usage(api_key, 0, 1)
+            else:
                 call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
 
         except Exception as e:
@@ -541,56 +513,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "error": {"message": f"Upstream error: {e}", "type": "proxy_error"}
             }).encode("utf-8"))
-            if api_key:
-                call_log.record(req_model if is_chat else "unknown", email, 0, 0, "error")
+            call_log.record(req_model if is_chat else "unknown", email, 0, 0, "error")
 
 
 
 def main():
     parser = argparse.ArgumentParser(description="stagewise Reverse Proxy")
     parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT, help=f"Proxy port (default: {DEFAULT_PORT})")
-    parser.add_argument("--create-key", type=str, metavar="NAME", help="Create a new API key with given name")
-    parser.add_argument("--list-keys", action="store_true", help="List all API keys with usage")
-    parser.add_argument("--delete-key", type=str, metavar="KEY", help="Delete an API key")
-    parser.add_argument("--toggle-key", type=str, metavar="KEY", help="Toggle enable/disable for an API key")
     parser.add_argument("--strategy", type=str,
                         choices=[STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST],
                         help=f"Account selection strategy (default: {STRATEGY_SPECIFIC})")
     args = parser.parse_args()
-
-    if args.create_key:
-        key, key_id = key_manager.create_key(args.create_key)
-        print(f"OK Created API key:")
-        print(f"    Name: {args.create_key}")
-        print(f"    Key:  {key}")
-        print(f"    !!! SAVE THIS KEY NOW - it will not be shown again !!!")
-        return
-
-    if args.list_keys:
-        keys = key_manager.list_keys()
-        if not keys:
-            print("No API keys found.")
-            return
-        print(f"{'Key':<40} {'Name':<20} {'Status':<10} {'Month Tokens':<15} {'Month Reqs':<12}")
-        print("-" * 100)
-        for k in keys:
-            status = "enabled" if k["enabled"] else "disabled"
-            print(f"{k['keyPreview']:<40} {k['name']:<20} {status:<10} {k['month_tokens']}/{k['monthly_token_limit']:<8} {k['month_requests']}/{k['monthly_request_limit']:<5}")
-        return
-
-    if args.delete_key:
-        if key_manager.delete_key(args.delete_key):
-            print(f"OK Deleted key: {args.delete_key[:30]}...")
-        else:
-            print(f"X Key not found: {args.delete_key[:30]}...")
-        return
-
-    if args.toggle_key:
-        if key_manager.toggle_key(args.toggle_key):
-            print(f"OK Key toggled: {args.toggle_key[:30]}...")
-        else:
-            print(f"X Key not found: {args.toggle_key[:30]}...")
-        return
 
     cfg = load_config()
 

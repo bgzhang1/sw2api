@@ -46,7 +46,6 @@ tailwind.config = {
   <a href="/chat" class="tab-btn px-4 py-3 text-sm font-medium text-slate-500 border-b-2 border-transparent cursor-pointer hover:text-slate-700 no-underline" data-tab="chat">Chat</a>
   <a href="/api-explorer" class="tab-btn px-4 py-3 text-sm font-medium text-slate-500 border-b-2 border-transparent cursor-pointer hover:text-slate-700 no-underline" data-tab="api">API Explorer</a>
   <a href="/proxy" class="tab-btn px-4 py-3 text-sm font-medium text-slate-500 border-b-2 border-transparent cursor-pointer hover:text-slate-700 no-underline" data-tab="proxy">Proxy</a>
-  <a href="/apikeys" class="tab-btn px-4 py-3 text-sm font-medium text-slate-500 border-b-2 border-transparent cursor-pointer hover:text-slate-700 no-underline" data-tab="apikeys">API Keys</a>
 </div>
 
 <div class="max-w-7xl mx-auto p-6">
@@ -247,20 +246,6 @@ Streaming:  Supported (SSE)</pre>
   </div>
 </div>
 
-<!-- ═══ API Keys ═══ -->
-<div class="tab-content" id="panel-apikeys">
-  <div class="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-    <h2 class="text-base font-semibold text-slate-900 mb-2">API Keys</h2>
-    <p class="text-sm text-slate-500 mb-4">Manage API keys for proxy access. Usage resets monthly.</p>
-    <div class="mb-3"><label class="block text-xs text-slate-500 mb-1">New Key Name</label><div class="flex gap-2"><input type="text" id="apikeyName" placeholder="e.g. dev-server" class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"><button class="px-4 py-2 bg-emerald-600 text-white rounded-lg text-sm font-medium hover:bg-emerald-700" onclick="createApiKey()">Create</button></div></div>
-    <div class="grid grid-cols-2 gap-3 mb-4">
-      <div><label class="block text-xs text-slate-500 mb-1">Monthly Token Limit</label><input type="number" id="apikeyTokenLimit" value="100000000" min="1000" step="1000000" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"></div>
-      <div><label class="block text-xs text-slate-500 mb-1">Monthly Request Limit</label><input type="number" id="apikeyReqLimit" value="1000000" min="100" step="10000" class="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"></div>
-    </div>
-    <div id="apikeysList"><span class="spinner"></span> Loading...</div>
-  </div>
-</div>
-
 </div>
 
 <script>
@@ -272,7 +257,7 @@ let chatAbortController = null;
 const TAB_ROUTES = {
   'dashboard': '/dashboard', 'accounts': '/accounts',
   'chat': '/chat', 'decrypt': '/decrypt', 'api': '/api-explorer',
-  'proxy': '/proxy', 'apikeys': '/apikeys',
+  'proxy': '/proxy',
 };
 
 document.querySelectorAll('.tab-btn').forEach(t => {
@@ -305,7 +290,7 @@ function switchTab(name) {
   if (name === 'dashboard') refreshDashboard();
   if (name === 'proxy') { refreshProxyStatus(); loadStrategy(); }
   if (name === 'accounts') loadAccounts(true);
-  if (name === 'apikeys') loadApiKeys();
+
 }
 
 // ─── Toast ───
@@ -760,74 +745,6 @@ async function setStrategy() {
     refreshProxyStatus();
     refreshDashboard();
   }
-}
-
-// ─── API Keys ───
-async function loadApiKeys() {
-  const r = await api('/api/keys', {silent:true});
-  const el = document.getElementById('apikeysList');
-  if (!r || !r.keys) { el.innerHTML = '<span class="text-red-600 text-sm">Failed to load</span>'; return; }
-  if (r.keys.length === 0) { el.innerHTML = '<div class="text-slate-500 text-sm">No API keys. Create one above.</div>'; return; }
-  let html = '';
-  for (const k of r.keys) {
-    const isEnabled = k.enabled;
-    const tBar = Math.min(k.token_usage_pct, 100);
-    const rBar = Math.min(k.request_usage_pct, 100);
-    const tCol = tBar > 80 ? '#ef4444' : tBar > 50 ? '#eab308' : '#22c55e';
-    const rCol = rBar > 80 ? '#ef4444' : rBar > 50 ? '#eab308' : '#22c55e';
-    html += `<div class="rounded-xl border border-slate-200 bg-white p-4 mb-3 shadow-sm">
-      <div class="flex items-center gap-2 mb-3">
-        <span class="font-semibold text-slate-900 flex-1">${escHtml(k.name)}</span>
-        <span class="text-xs font-medium px-2 py-0.5 rounded-full ${isEnabled?'bg-emerald-100 text-emerald-700':'bg-red-100 text-red-700'}">${isEnabled?'Active':'Disabled'}</span>
-        <button class="px-2.5 py-1 text-xs font-medium bg-slate-200 text-slate-700 rounded-lg hover:bg-slate-300" onclick="toggleApiKey('${k.key_id}')">${isEnabled?'Disable':'Enable'}</button>
-        <button class="px-2.5 py-1 text-xs font-medium bg-red-600 text-white rounded-lg hover:bg-red-700" onclick="deleteApiKey('${k.key_id}')">Delete</button>
-      </div>
-      <div class="text-xs text-slate-500 font-mono mb-3">${k.keyPreview}</div>
-      <div class="text-xs text-slate-500 mb-1">Tokens: ${k.month_tokens.toLocaleString()} / ${k.monthly_token_limit.toLocaleString()} (${k.token_usage_pct}%)</div>
-      <div class="bg-slate-100 rounded h-1.5 mb-2 overflow-hidden"><div class="h-full rounded" style="width:${tBar}%;background:${tCol}"></div></div>
-      <div class="text-xs text-slate-500 mb-1">Requests: ${k.month_requests.toLocaleString()} / ${k.monthly_request_limit.toLocaleString()} (${k.request_usage_pct}%)</div>
-      <div class="bg-slate-100 rounded h-1.5 mb-2 overflow-hidden"><div class="h-full rounded" style="width:${rBar}%;background:${rCol}"></div></div>
-      <div class="text-xs text-slate-400">Total: ${k.total_tokens.toLocaleString()} tokens, ${k.total_requests.toLocaleString()} requests</div>
-    </div>`;
-  }
-  el.innerHTML = html;
-}
-
-async function createApiKey() {
-  const name = document.getElementById('apikeyName').value.trim();
-  if (!name) { toast('Enter a key name','error'); return; }
-  const monthly_tokens = parseInt(document.getElementById('apikeyTokenLimit').value) || undefined;
-  const monthly_requests = parseInt(document.getElementById('apikeyReqLimit').value) || undefined;
-  const r = await api('/api/keys/create', {body:{name, monthly_tokens, monthly_requests}});
-  if (r && r.success) {
-    document.getElementById('apikeyName').value = '';
-    loadApiKeys();
-    // Show full key once with save warning
-    const overlay = document.createElement('div');
-    overlay.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
-    overlay.innerHTML = `<div class="bg-white rounded-xl shadow-2xl p-6 max-w-lg w-full mx-4">
-      <div class="text-base font-bold text-slate-900 mb-2">API Key Created</div>
-      <div class="text-sm text-slate-600 mb-4">Save this key now. It will <strong>never</strong> be shown again.</div>
-      <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4">
-        <div class="text-xs text-amber-700 font-medium mb-1">Key (click to copy)</div>
-        <div class="text-sm font-mono text-slate-900 break-all select-all cursor-pointer" onclick="navigator.clipboard.writeText(this.textContent); toast('Copied!','success')">${escHtml(r.key)}</div>
-      </div>
-      <div class="text-xs text-slate-400">Name: ${escHtml(r.name)}</div>
-      <button class="mt-4 w-full px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700" onclick="this.closest('.fixed').remove()">I've Saved It</button>
-    </div>`;
-    document.body.appendChild(overlay);
-  }
-}
-
-async function deleteApiKey(keyId) {
-  if (!confirm('Delete this API key? This cannot be undone.')) return;
-  const r = await api('/api/keys/delete', {body:{key_id: keyId}});
-  if (r && r.success) { toast('Deleted','info'); loadApiKeys(); }
-}
-
-async function toggleApiKey(keyId) {
-  const r = await api('/api/keys/toggle', {body:{key_id: keyId}});
-  if (r && r.success) { loadApiKeys(); }
 }
 
 // ─── Init ───

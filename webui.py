@@ -8,7 +8,7 @@ Features:
   - Proxy: start/stop reverse proxy
   - Chat: LLM chat via proxy
   - API Explorer: test all endpoints
-  - API Keys: manage local access keys
+  - Proxy: manage local access keys
 
 Usage:
   python webui.py [--port 8080]
@@ -30,7 +30,6 @@ from pathlib import Path
 
 from flask import Flask, render_template, request, jsonify, Response
 import call_log
-import key_manager
 from proxy import (
     STRATEGY_SPECIFIC, STRATEGY_FILL_FIRST,
     select_account, get_account_state, AccountState,
@@ -192,7 +191,6 @@ def api_strategy_set():
 @app.route("/chat")
 @app.route("/api-explorer")
 @app.route("/proxy")
-@app.route("/apikeys")
 def index():
     tab_map = {
         "dashboard": "dashboard",
@@ -201,7 +199,6 @@ def index():
         "decrypt": "decrypt",
         "api-explorer": "api",
         "proxy": "proxy",
-        "apikeys": "apikeys",
         "machineid": "machineid",
     }
     path = request.path.strip("/") or "dashboard"
@@ -372,25 +369,6 @@ def _start_proxy_instance(port):
             body = self.rfile.read(cl) if cl > 0 else b""
 
             is_chat = "/chat/completions" in self.path
-            api_key = key_manager.extract_key_from_header(self.headers.get("Authorization", ""))
-            if is_chat or api_key:
-                is_local = self.client_address[0] in ("127.0.0.1", "::1", "localhost")
-                if not api_key and not is_local:
-                    self.send_response(401)
-                    self.send_header("Content-Type", "application/json")
-                    self._cors()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "API key required. Create one in the WebUI.", "type": "auth_error"}).encode())
-                    return
-                if api_key:
-                    k = key_manager.validate_key(api_key)
-                    if k is None:
-                        self.send_response(401)
-                        self.send_header("Content-Type", "application/json")
-                        self._cors()
-                        self.end_headers()
-                        self.wfile.write(json.dumps({"error": "Invalid or rate-limited API key", "type": "auth_error"}).encode())
-                        return
 
             email, acct, token = self._select_account()
             if not token:
@@ -477,9 +455,7 @@ def _start_proxy_instance(port):
                     except BrokenPipeError:
                         pass
                     conn.close()
-                    if api_key:
-                        key_manager.record_usage(api_key, 0, 1)
-                        call_log.record(req_model if is_chat else model, email, 0, 0, "fail")
+                    call_log.record(req_model if is_chat else "unknown", email, 0, 0, "fail")
                     return
 
                 self.send_response(resp.status)
@@ -538,11 +514,9 @@ def _start_proxy_instance(port):
                         except Exception:
                             pass
                 conn.close()
-                if api_key and tokens_used > 0:
-                    key_manager.record_usage(api_key, tokens_used)
+                if tokens_used > 0:
                     call_log.record(model, email, i_tokens, o_tokens)
-                elif api_key:
-                    key_manager.record_usage(api_key, 0, 1)
+                else:
                     call_log.record(req_model if is_chat else model, email, 0, 0, "fail")
             except Exception as e:
                 if not self._responded:
@@ -551,8 +525,7 @@ def _start_proxy_instance(port):
                     self._cors()
                     self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode())
-                if api_key:
-                    call_log.record(req_model if is_chat else "unknown", email, 0, 0, "error")
+                call_log.record(req_model if is_chat else "unknown", email, 0, 0, "error")
 
     try:
         server = HTTPServer(("0.0.0.0", port), Handler)
@@ -836,46 +809,6 @@ def api_call_log():
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 10, type=int)
     return jsonify(call_log.get_page(page, per_page))
-
-
-@app.route("/api/keys")
-def api_keys():
-    return jsonify({"keys": key_manager.list_keys()})
-
-
-@app.route("/api/keys/create", methods=["POST"])
-def api_keys_create():
-    name = request.json.get("name", "").strip()
-    if not name:
-        return jsonify({"error": "Name required"}), 400
-    monthly_tokens = request.json.get("monthly_tokens")
-    monthly_requests = request.json.get("monthly_requests")
-    key, key_id = key_manager.create_key(name, monthly_tokens, monthly_requests)
-    return jsonify({
-        "success": True, "key": key, "key_id": key_id, "keyPreview": key[:20] + "...", "name": name,
-        "monthly_tokens": monthly_tokens or key_manager.DEFAULT_MONTHLY_TOKENS,
-        "monthly_requests": monthly_requests or key_manager.DEFAULT_MONTHLY_REQUESTS,
-    })
-
-
-@app.route("/api/keys/delete", methods=["POST"])
-def api_keys_delete():
-    key_id = request.json.get("key_id", "").strip()
-    if not key_id:
-        return jsonify({"error": "key_id required"}), 400
-    if key_manager.delete_key(key_id):
-        return jsonify({"success": True})
-    return jsonify({"error": "Key not found"}), 404
-
-
-@app.route("/api/keys/toggle", methods=["POST"])
-def api_keys_toggle():
-    key_id = request.json.get("key_id", "").strip()
-    if not key_id:
-        return jsonify({"error": "key_id required"}), 400
-    if key_manager.toggle_key(key_id):
-        return jsonify({"success": True})
-    return jsonify({"error": "Key not found"}), 404
 
 
 def main():
