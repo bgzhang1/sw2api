@@ -1,35 +1,14 @@
-"""stagewise 自动注册脚本
-=========================
+"""stagewise 全自动注册脚本
 
-支持两种模式：
+自动创建临时邮箱 -> 通过 Playwright 注册 -> 自动读取 OTP -> 完成验证 -> 提取 Token
 
-模式 1: 浏览器自动化（推荐）
-  - 自动打开浏览器，填入临时邮箱
-  - 手动完成 Turnstile 验证码（仅首次需要）
-  - 自动从 Mail.tm 读取 OTP 并完成注册
-  - 支持批量注册多个账号
-
-模式 2: API 直连
-  - 需要从其他渠道获取 Turnstile token
-  - 适用于已接入验证码服务的场景
-
-依赖安装:
+用法:
   pip install playwright requests
   playwright install chromium
 
-用法:
-  # 浏览器模式（默认，会打开浏览器窗口）
-  python auto_register.py
-  python auto_register.py --count 5
-
-  # 无头模式（需要 Turnstile token 来源）
-  python auto_register.py --headless --turnstile-token TOKEN
-
-  # 导入到 WebUI
-  python auto_register.py --output accounts.json
-  curl -X POST http://localhost:8080/api/accounts/add-batch \
-    -H "Content-Type: application/json" \
-    -d @accounts.json
+  python auto_register.py                    # 注册 1 个
+  python auto_register.py --count 5           # 批量 5 个
+  python auto_register.py --output accts.json # 导出 JSON 供 WebUI 导入
 """
 
 import argparse
@@ -47,77 +26,60 @@ API_HOST = "api.stagewise.io"
 MAIL_API = "https://api.mail.tm"
 
 
-# ═══════════════════════════════════════════════════════════════
-#  临时邮箱模块 (Mail.tm)
-# ═══════════════════════════════════════════════════════════════
-
 class TempMail:
-    """Mail.tm 临时邮箱客户端"""
+    """Mail.tm 临时邮箱"""
 
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
-        r = self.session.get(f"{MAIL_API}/domains", timeout=10)
+        self.sess = requests.Session()
+        self.sess.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+        r = self.sess.get(f"{MAIL_API}/domains", timeout=10)
         domains = r.json().get("hydra:member", [])
         if not domains:
             raise RuntimeError("无法获取 Mail.tm 域名")
         self.domain = domains[0]["domain"]
-        local_part = f"sw{uuid.uuid4().hex[:8]}"
-        self.email = f"{local_part}@{self.domain}"
+        local = f"sw{uuid.uuid4().hex[:8]}"
+        self.email = f"{local}@{self.domain}"
         self.password = uuid.uuid4().hex[:16]
-        r = self.session.post(f"{MAIL_API}/accounts", json={"address": self.email, "password": self.password})
+        r = self.sess.post(f"{MAIL_API}/accounts", json={"address": self.email, "password": self.password})
         if r.status_code not in (200, 201):
-            raise RuntimeError(f"创建临时邮箱失败: {r.status_code} {r.text}")
-        r = self.session.post(f"{MAIL_API}/token", json={"address": self.email, "password": self.password})
-        token = r.json().get("token")
-        self.session.headers.update({"Authorization": f"Bearer {token}"})
-        print(f"  [📧] 临时邮箱: {self.email}")
+            raise RuntimeError(f"创建临时邮箱失败: {r.text}")
+        r = self.sess.post(f"{MAIL_API}/token", json={"address": self.email, "password": self.password})
+        self.sess.headers.update({"Authorization": f"Bearer {r.json()['token']}"})
+        print(f"   邮箱: {self.email}")
 
     def wait_for_otp(self, timeout=120):
-        """等待 OTP 邮件，返回 (otp_code, message_id)"""
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
-                r = self.session.get(f"{MAIL_API}/messages", timeout=10)
-                msgs = r.json().get("hydra:member", [])
-                for msg in msgs:
-                    r2 = self.session.get(f"{MAIL_API}/messages/{msg['id']}", timeout=10)
+                r = self.sess.get(f"{MAIL_API}/messages", timeout=10)
+                for msg in r.json().get("hydra:member", []):
+                    r2 = self.sess.get(f"{MAIL_API}/messages/{msg['id']}", timeout=10)
                     body = r2.json().get("text", "") or r2.json().get("html", "")
-                    otp_match = re.search(r"\b(\d{6})\b", body)
-                    if otp_match:
-                        print(f"  [📧] 收到 OTP: {otp_match.group(1)}")
-                        return otp_match.group(1), msg["id"]
+                    m = re.search(r"\b(\d{6})\b", body)
+                    if m:
+                        return m.group(1)
             except Exception:
                 pass
             time.sleep(2)
-        raise TimeoutError("等待 OTP 超时")
+        raise TimeoutError("OTP 等待超时")
 
     def cleanup(self):
         try:
-            requests.delete(f"{MAIL_API}/accounts/{self.email}", timeout=5)
+            requests.delete(f"{MAIL_API}/accounts/{self.email}", timeout=3)
         except Exception:
             pass
 
 
-# ═══════════════════════════════════════════════════════════════
-#  浏览器自动化注册
-# ═══════════════════════════════════════════════════════════════
+def register(temp_mail=None, email=None, headless=False):
+    """全自动注册一个 stagewise 账号。
 
-def register_with_browser(temp_mail: TempMail, headless: bool = False,
-                          turnstile_token: str = None) -> dict:
-    """
-    用 Playwright 控制 Chrome 完成 stagewise 注册。
-
-    流程:
-      1. 打开 console.stagewise.io
-      2. 填入临时邮箱
-      3. 手动 / 自动处理 Turnstile
-      4. 等待 OTP 邮件 → 自动填入 → 完成注册
-      5. 从 localStorage/cookie 提取 session token
+    返回: {"email": str, "token": str} 或抛出异常
     """
     from playwright.sync_api import sync_playwright
 
-    print(f"  [🌐] 启动 Playwright{' (无头模式)' if headless else ''}...")
+    if email and not temp_mail:
+        # 使用已有邮箱 — 需要手动提供 OTP
+        pass
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -133,96 +95,90 @@ def register_with_browser(temp_mail: TempMail, headless: bool = False,
             viewport={"width": 1280, "height": 800},
         )
         page = ctx.new_page()
-
-        # 注入反自动化检测
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-        """)
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
 
         try:
+            # 1. 打开页面
             page.goto(CONSOLE_URL, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_selector("#email", timeout=10000)
+            page.wait_for_timeout(3000)  # 等 React 和 Turnstile 加载
 
             # 2. 填入邮箱
-            page.fill("#email", temp_mail.email)
-            print(f"  [🌐] 已填入邮箱: {temp_mail.email}")
+            target_email = email or temp_mail.email
+            page.fill("#email", target_email)
+            page.wait_for_timeout(500)
 
-            # 3. 处理 Turnstile
-            if turnstile_token:
-                # 注入 Turnstile token
-                page.evaluate(f"""
-                    document.querySelector('form').addEventListener('submit', function() {{
-                        const input = document.createElement('input');
-                        input.type = 'hidden';
-                        input.name = 'cf-turnstile-response';
-                        input.value = '{turnstile_token}';
-                        this.appendChild(input);
-                    }});
-                """)
-                page.click("button[type='submit']")
-                print("  [🌐] 已注入 Turnstile token 并提交")
-            else:
-                # 点击提交——Turnstile 可能弹出交互式验证
-                page.click("button[type='submit']")
-                try:
-                    # 检查是否有 Turnstile iframe 出现
-                    turnstile_iframe = page.frame_locator("iframe[src*='challenges.cloudflare.com']").first
-                    if turnstile_iframe.locator("body").is_visible(timeout=3000):
-                        print("\n  ⚠️ 请在浏览器窗口中完成 Turnstile 验证...")
-                        print("     完成后脚本将自动继续。\n")
-                        # 等待 Turnstile 完成（submit 重新启用）
-                        page.wait_for_timeout(5000)
-                except Exception:
-                    pass
-
-            # 4. 等待 OTP 到达
-            print("  [⏳] 等待 OTP 邮件...")
-            otp, _ = temp_mail.wait_for_otp(timeout=120)
-
-            # 5. 填入 OTP（等待 OTP 输入框出现）
+            # 3. 提交 (Turnstile 会在无头/有头模式自动通过)
+            page.click("button[type='submit']")
             page.wait_for_timeout(2000)
-            try:
-                # 尝试 6 个独立输入框
-                digit_inputs = page.locator("input[type='text']:not(#email)")
-                count = digit_inputs.count()
-                if count >= 6:
-                    for i, d in enumerate(otp):
-                        digit_inputs.nth(i).fill(d)
-                else:
-                    # 单个输入框
-                    otp_input = page.locator("input[autocomplete='one-time-code']")
-                    if otp_input.is_visible(timeout=2000):
-                        otp_input.fill(otp)
-                    else:
-                        page.fill("input[type='text']:not(#email)", otp)
-            except Exception:
-                # 兜底: 逐字符输入
-                for i, d in enumerate(otp, 1):
-                    try:
-                        page.fill(f"input:nth-of-type({i})", d)
-                    except Exception:
-                        pass
 
-            # 点击提交
+            # 检查是否进入验证码页
+            current_text = page.evaluate("document.body.innerText")
+            if "error" in current_text.lower() and "captcha" in current_text.lower():
+                # Turnstile 没通过 — 等待用户手动完成
+                print("   等待手动完成 Turnstile 验证...")
+                page.wait_for_timeout(15000)
+
+            print("   等待 OTP...")
+
+            # 4. 获取 OTP
+            if temp_mail:
+                otp = temp_mail.wait_for_otp(timeout=120)
+                print(f"   收到 OTP: {otp}")
+            elif email:
+                otp = input(f"   OTP 已发送到 {email}，请输入: ").strip()
+            else:
+                raise ValueError("需要 email 或 temp_mail")
+
+            # 5. 填入 OTP
             page.wait_for_timeout(1000)
+
+            # 尝试多种 OTP 输入方式
+            inputs_before = page.locator("input[type='text']").all()
+            page.wait_for_timeout(500)
+
+            # 查找 OTP 输入框
+            otp_filled = False
             try:
-                page.click("button[type='submit']")
+                # 方式 1: 6 个独立输入框
+                for i, d in enumerate(otp):
+                    inp = page.locator(f"input[type='text']:not(#email)").nth(i)
+                    if inp.is_visible(timeout=1000):
+                        inp.fill(d)
+                        otp_filled = True
             except Exception:
                 pass
 
-            # 6. 等待跳转到 dashboard / 注册完成
-            try:
-                page.wait_for_url("**/dashboard**", timeout=30000)
-                print("  [✅] 注册成功！控制台已加载")
-            except Exception:
-                print("  [⚠️] 可能已注册成功，尝试提取 token...")
+            if not otp_filled:
+                try:
+                    # 方式 2: 单个输入框
+                    page.fill("input[autocomplete='one-time-code']", otp)
+                    otp_filled = True
+                except Exception:
+                    pass
 
-            # 7. 提取 token
+            if not otp_filled:
+                # 方式 3: 所有 text input
+                for i, d in enumerate(otp):
+                    try:
+                        page.locator("input[type='text']").nth(i + 1).fill(d)
+                    except Exception:
+                        pass
+
+            page.wait_for_timeout(1000)
+
+            # 6. 提交验证码
+            try:
+                page.locator("button[type='submit']").click()
+            except Exception:
+                pass
+
+            # 7. 等待跳转到控制台
+            page.wait_for_timeout(5000)
+
+            # 8. 提取 token
             token = page.evaluate("""() => {
-                // 检查 localStorage
-                const keys = Object.keys(localStorage);
-                for (const k of keys) {
+                // localStorage
+                for (const k of Object.keys(localStorage)) {
                     try {
                         const v = JSON.parse(localStorage[k]);
                         if (v && typeof v === 'object') {
@@ -232,18 +188,10 @@ def register_with_browser(temp_mail: TempMail, headless: bool = False,
                         }
                     } catch(e) {}
                 }
-                // 检查 sessionStorage
-                for (const k of Object.keys(sessionStorage)) {
-                    try {
-                        const v = JSON.parse(sessionStorage[k]);
-                        if (v && v.token) return v.token;
-                    } catch(e) {}
-                }
                 return null;
             }""")
 
             if not token:
-                # 从 cookie 获取
                 for c in ctx.cookies():
                     if any(t in c["name"].lower() for t in ("token", "session", "auth")):
                         token = c["value"]
@@ -253,11 +201,11 @@ def register_with_browser(temp_mail: TempMail, headless: bool = False,
             browser.close()
 
             if token:
-                print(f"  [🔑] Token ({token[:20]}...{token[-10:]})")
+                print(f"   Token: {token[:30]}...")
+                return {"email": target_email, "token": token}
             else:
-                print("  [⚠️] 未能提取 token - 请手动从浏览器获取")
-
-            return {"email": temp_mail.email, "token": token}
+                print("   ⚠️ Token 未自动提取，请手动从浏览器获取")
+                return {"email": target_email, "token": None}
 
         except Exception:
             ctx.close()
@@ -265,131 +213,56 @@ def register_with_browser(temp_mail: TempMail, headless: bool = False,
             raise
 
 
-# ═══════════════════════════════════════════════════════════════
-#  API 直连注册
-# ═══════════════════════════════════════════════════════════════
-
-def register_via_api(email: str, turnstile_token: str, otp_code: str = None) -> dict:
-    """用 API 直连注册（需要 Turnstile token 来源）"""
-    sess = requests.Session()
-    sess.headers.update({
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Origin": CONSOLE_URL,
-        "Referer": f"{CONSOLE_URL}/login",
-    })
-
-    # 1. 发送 OTP
-    print(f"  [📤] 发送 OTP 到 {email}...")
-    r = sess.post(f"https://{API_HOST}/v1/auth/email-otp/send-verification-otp", json={
-        "email": email, "type": "sign-in",
-        "cf-turnstile-response": turnstile_token,
-    })
-    if r.status_code != 200:
-        raise RuntimeError(f"发送 OTP 失败 ({r.status_code}): {r.text}")
-    print(f"  [📤] OTP 已发送")
-
-    # 2. 获取 OTP
-    if otp_code:
-        otp = otp_code
-    else:
-        otp = input("  OTP 代码: ").strip()
-
-    # 3. 验证
-    print(f"  [🔐] 验证 OTP...")
-    r = sess.post(f"https://{API_HOST}/v1/auth/sign-in/email-otp", json={
-        "email": email, "otp": otp,
-        "cf-turnstile-response": turnstile_token,
-    })
-    if r.status_code != 200:
-        raise RuntimeError(f"验证 OTP 失败 ({r.status_code}): {r.text}")
-
-    j = r.json()
-    token = (r.headers.get("set-auth-token")
-             or j.get("token")
-             or (j.get("data") or {}).get("token"))
-    user = j.get("user") or (j.get("data") or {}).get("user")
-    if not token:
-        raise RuntimeError(f"未获取到 token: 响应={j}")
-
-    return {"email": user.get("email", email) if user else email,
-            "token": token, "user": user}
-
-
-# ═══════════════════════════════════════════════════════════════
-#  主逻辑
-# ═══════════════════════════════════════════════════════════════
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="stagewise 自动注册脚本",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
+    parser = argparse.ArgumentParser(description="stagewise 全自动注册")
     parser.add_argument("--count", "-n", type=int, default=1, help="注册数量")
-    parser.add_argument("--headless", action="store_true", help="浏览器无头模式")
-    parser.add_argument("--turnstile-token", type=str, help="预设 Turnstile token")
-    parser.add_argument("--api-mode", action="store_true", help="API 直连模式（需 Turnstile token）")
-    parser.add_argument("--output", "-o", type=str, help="输出 JSON 文件路径")
+    parser.add_argument("--headless", action="store_true", help="无头模式（默认显示浏览器）")
+    parser.add_argument("--output", "-o", type=str, help="输出 JSON 文件")
     parser.add_argument("--email", type=str, help="指定邮箱（默认用临时邮箱）")
-    parser.add_argument("--otp", type=str, help="预设 OTP 代码（API 模式）")
     args = parser.parse_args()
 
     accounts = []
-
     for i in range(args.count):
-        print(f"\n{'='*50}")
-        print(f"  账号 {i+1}/{args.count}")
-        print(f"{'='*50}\n")
+        print(f"\n--- 第 {i+1}/{args.count} 个账号 ---")
 
         try:
-            if args.api_mode:
-                email = args.email or input("  邮箱: ").strip()
-                token = args.turnstile_token or input("  Turnstile token: ").strip()
-                result = register_via_api(email, token, args.otp)
-            else:
+            tm = None
+            if not args.email:
                 tm = TempMail()
-                try:
-                    email = args.email or tm.email
-                    if args.email:
-                        tm.email = args.email
-                    result = register_with_browser(tm, headless=args.headless,
-                                                   turnstile_token=args.turnstile_token)
-                finally:
-                    tm.cleanup()
+
+            result = register(
+                temp_mail=tm,
+                email=args.email if args.count == 1 else None,
+                headless=args.headless,
+            )
+
+            if tm:
+                tm.cleanup()
 
             if result and result.get("token"):
-                token = result["token"]
                 accounts.append(result)
-                print(f"\n  ✅ #{i+1}: {result['email']}")
-                print(f"     Token: {token[:30]}...")
-
                 if args.output:
-                    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
                     with open(args.output, "w", encoding="utf-8") as f:
                         json.dump(accounts, f, indent=2, ensure_ascii=False)
+
         except Exception as e:
-            print(f"\n  ❌ 失败: {e}")
+            print(f"  失败: {e}")
             if args.count == 1:
                 raise
 
-    # ─── 结束 ───
+    # 输出
     print(f"\n{'='*50}")
     print(f"  完成: {len(accounts)}/{args.count}")
     print(f"{'='*50}")
 
     if accounts:
-        print(f"\n📥 导入 WebUI 的两种方式:\n")
-        print(f"方式 1 - API 批量导入:")
-        print(f'  curl -X POST http://localhost:8080/api/accounts/add-batch \\')
+        print(f"\n📥 导入 WebUI:\n")
+        print(f"  curl -X POST http://localhost:8080/api/accounts/add-batch \\")
         print(f'    -H "Content-Type: application/json" \\')
-        print(f'    -d \'{{"accounts": {json.dumps(accounts, ensure_ascii=False)}}}\'')
-        print(f"\n方式 2 - 文本格式（在 WebUI Accounts 页面粘贴）:")
+        print(f"    -d '{json.dumps({'accounts': accounts}, ensure_ascii=False)}'")
+        print()
         for a in accounts:
             print(f"  {a['email']}|{a['token']}")
-
-    return 0 if len(accounts) == args.count else 1
 
 
 if __name__ == "__main__":
