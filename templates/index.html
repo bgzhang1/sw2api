@@ -459,9 +459,17 @@ const ACCT_PAGE_SIZE = 6;
 const ACCT_COLS = 3;
 
 async function loadAccounts(silent) {
-  const r = await api('/api/accounts', {silent:true});
+  const r = await api(`/api/accounts?page=${_acctPage}&per_page=${ACCT_PAGE_SIZE}`, {silent:true});
   if (!r) { document.getElementById('accountsList').innerHTML = '<span class="text-red-600 text-sm">Failed to load accounts</span>'; return; }
-  _accountsData = r.accounts || [];
+  const incoming = r.accounts || [];
+  const prevMap = {};
+  if (_accountsData) _accountsData.forEach(a => { prevMap[a.email] = a; });
+  _accountsData = incoming.map(a => {
+    const old = prevMap[a.email];
+    if (old && a.usage === null && old.usage) a.usage = old.usage;
+    if (old && a.expiresAt === null && old.expiresAt) a.expiresAt = old.expiresAt;
+    return a;
+  });
   const maxPage = Math.max(1, Math.ceil(_accountsData.length / ACCT_PAGE_SIZE));
   if (_acctPage > maxPage) _acctPage = maxPage;
   renderAccounts();
@@ -540,7 +548,7 @@ function renderAccounts() {
 
 function goAcctPage(p) {
   _acctPage = p;
-  renderAccounts();
+  loadAccounts(true);
 }
 
 async function switchAccount(email) {
@@ -577,16 +585,25 @@ async function batchImport() {
   if (!text) { toast('Paste account data first', 'error'); return; }
   document.getElementById('btnBatchImport').disabled = true;
   document.getElementById('batchResult').textContent = 'Importing...';
-  const r = await api('/api/accounts/add-batch', {body:{batch_text: text}});
+  const r = await api('/api/accounts/add-batch', {body:{batch_text: text}, throwErr:false});
   document.getElementById('btnBatchImport').disabled = false;
-  if (r && r.success) {
-    document.getElementById('batchResult').textContent = '';
-    toast('Imported ' + r.added + ' accounts (total: ' + r.total + ')', 'success');
-    document.getElementById('batchImportText').value = '';
-    loadAccounts();
-    refreshDashboard();
+  const el = document.getElementById('batchResult');
+  el.innerHTML = '';
+  if (r) {
+    let msg = `Added ${r.added} / total ${r.total}`;
+    if (r.overwritten && r.overwritten.length) msg += `; Overwritten ${r.overwritten.length}: ${r.overwritten.map(o=>o.email).join(', ')}`;
+    if (r.skipped && r.skipped.length) msg += `; Skipped ${r.skipped.length}: ${r.skipped.map(s=>`${s.email} (${s.reason})`).join(', ')}`;
+    if (r.errors && r.errors.length) msg += `; Failed lines: ${r.errors.map(e=>`[${e.source}#${e.line}] ${e.reason}`).join('; ')}`;
+    if (r.errors && r.errors.length) {
+      el.innerHTML = `<span class="text-amber-600 text-xs">${escHtml(msg)}</span>`;
+    } else {
+      toast(msg, 'success');
+      document.getElementById('batchImportText').value = '';
+      loadAccounts();
+      refreshDashboard();
+    }
   } else {
-    document.getElementById('batchResult').textContent = '';
+    el.innerHTML = `<span class="text-red-600 text-xs">Import failed (network error)</span>`;
   }
 }
 

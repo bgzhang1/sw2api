@@ -599,6 +599,15 @@ def api_llm_test():
 def api_accounts():
     cfg = load_config()
     active = cfg.get("activeAccount")
+    page = max(1, request.args.get("page", 1, type=int))
+    per_page = max(1, request.args.get("per_page", 0, type=int))
+    all_emails = list(cfg.get("accounts", {}).keys())
+    total = len(all_emails)
+    if per_page > 0:
+        start = (page - 1) * per_page
+        page_emails = set(all_emails[start:start + per_page])
+    else:
+        page_emails = set(all_emails)
     entries = {email: {"email": email, "tokenPreview": None, "user": acct.get("user"), "active": email == active, "disabled": acct.get("disabled", False), "usage": None, "expiresAt": None} for email, acct in cfg.get("accounts", {}).items()}
 
     tasks = {}
@@ -608,6 +617,8 @@ def api_accounts():
             if not token:
                 continue
             entries[email]["tokenPreview"] = token[:20] + "..." if token else None
+            if email not in page_emails:
+                continue
             tasks[pool.submit(api_request, "GET", "/v1/usage/current", token, timeout=10)] = (email, "usage")
             tasks[pool.submit(api_request, "GET", "/v1/auth/get-session", token, timeout=10)] = (email, "session")
 
@@ -625,7 +636,7 @@ def api_accounts():
             except Exception:
                 pass
 
-    return jsonify({"accounts": list(entries.values()), "activeAccount": active})
+    return jsonify({"accounts": list(entries.values()), "activeAccount": active, "total": total, "page": page, "per_page": per_page})
 
 
 @app.route("/api/accounts/switch", methods=["POST"])
@@ -677,7 +688,7 @@ def api_accounts_refresh_usage():
                     enabled_count += 1
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        pool.map(lambda x: check_and_enable(*x), accounts.items())
+        list(pool.map(lambda x: check_and_enable(*x), accounts.items()))
 
     if enabled_count > 0:
         save_config(cfg)
@@ -728,43 +739,90 @@ def api_accounts_add():
 @app.route("/api/accounts/add-batch", methods=["POST"])
 def api_accounts_add_batch():
     cfg = load_config()
+    existing = cfg.get("accounts", {})
     data = request.json or {}
 
-    # JSON format: {"accounts": [{"email": "...", "token": "..."}, ...]}
-    accounts_list = data.get("accounts", [])
-    # Text format: {"batch_text": "email1|token1\nemail2|token2"}
+    raw_items = []  # (source_label, line_no, email_raw, token_raw)
+    errors = []     # {line, source, reason}
+
+    json_list = data.get("accounts", [])
+    if not isinstance(json_list, list):
+        return jsonify({"error": "`accounts` must be a JSON array."}), 400
+    for i, acct in enumerate(json_list):
+        if not isinstance(acct, dict):
+            errors.append({"line": i + 1, "source": "json", "reason": "Each item must be a JSON object"})
+            continue
+        email = acct.get("email")
+        token = acct.get("token")
+        if not isinstance(email, str) or not isinstance(token, str):
+            errors.append({"line": i + 1, "source": "json", "reason": "email/token must be strings"})
+            continue
+        raw_items.append(("json", i + 1, email.strip(), token.strip()))
+
     batch_text = data.get("batch_text", "")
-
+    if not isinstance(batch_text, str):
+        batch_text = ""
     if batch_text.strip():
-        for line in batch_text.strip().split("\n"):
-            line = line.strip()
-            if not line:
+        for ln, line in enumerate(batch_text.split("\n"), 1):
+            s = line.strip()
+            if not s:
                 continue
-            parts = line.split("|", 1)
-            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
-                email = parts[0].strip()
-                token = parts[1].strip()
-                if "@" in email:
-                    accounts_list.append({"email": email, "token": token})
+            parts = s.split("|", 1)
+            if len(parts) != 2:
+                errors.append({"line": ln, "source": "text", "reason": "Missing '|' separator"})
+                continue
+            email, token = parts[0].strip(), parts[1].strip()
+            if not email:
+                errors.append({"line": ln, "source": "text", "reason": "Empty email"})
+                continue
+            if not token:
+                errors.append({"line": ln, "source": "text", "reason": "Empty token"})
+                continue
+            if "@" not in email:
+                errors.append({"line": ln, "source": "text", "reason": "Invalid email (missing @)"})
+                continue
+            raw_items.append(("text", ln, email, token))
 
-    if not accounts_list:
-        return jsonify({"error": "No valid accounts provided. Use JSON array or batch_text format."}), 400
+    if not raw_items:
+        return jsonify({"error": "No valid accounts provided. Use JSON array or batch_text format.", "errors": errors}), 400
 
     added = 0
-    for acct in accounts_list:
-        email = acct.get("email", "").strip()
-        token = acct.get("token", "").strip()
-        if email and token and "@" in email:
-            cfg["accounts"][email] = {"token": token, "user": None}
+    overwritten = []
+    skipped_dup = []
+    seen_in_batch = set()
+
+    for source, line_no, email, token in raw_items:
+        if email in seen_in_batch:
+            skipped_dup.append({"line": line_no, "source": source, "email": email, "reason": "Duplicate within this import"})
+            continue
+        seen_in_batch.add(email)
+        if email in existing:
+            if existing[email].get("token") == token:
+                skipped_dup.append({"line": line_no, "source": source, "email": email, "reason": "Already exists with same token"})
+                continue
+            existing[email]["token"] = token
+            overwritten.append({"line": line_no, "source": source, "email": email})
+            added += 1
+        else:
+            existing[email] = {"token": token, "user": None}
             added += 1
 
-    if added == 0:
-        return jsonify({"error": "No valid accounts parsed. Use format: email|token per line."}), 400
+    cfg["accounts"] = existing
+    if not cfg.get("activeAccount") and existing:
+        cfg["activeAccount"] = next(iter(existing))
 
-    if not cfg.get("activeAccount"):
-        cfg["activeAccount"] = list(cfg["accounts"].keys())[0]
-    save_config(cfg)
-    return jsonify({"success": True, "added": added, "total": len(cfg["accounts"]), "activeAccount": cfg["activeAccount"]})
+    if added > 0:
+        save_config(cfg)
+
+    return jsonify({
+        "success": added > 0 or (not errors and (skipped_dup or overwritten)),
+        "added": added,
+        "overwritten": overwritten,
+        "skipped": skipped_dup,
+        "errors": errors,
+        "total": len(existing),
+        "activeAccount": cfg.get("activeAccount"),
+    })
 
 
 @app.route("/api/chat", methods=["POST"])
