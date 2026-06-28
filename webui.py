@@ -596,6 +596,7 @@ def api_accounts():
     active = cfg.get("activeAccount")
     page = max(1, request.args.get("page", 1, type=int))
     per_page = max(1, request.args.get("per_page", 0, type=int))
+    refresh = request.args.get("refresh", 0, type=int) == 1
     all_emails = list(cfg.get("accounts", {}).keys())
     total = len(all_emails)
     if per_page > 0:
@@ -603,11 +604,12 @@ def api_accounts():
         page_emails = set(all_emails[start:start + per_page])
     else:
         page_emails = set(all_emails)
-    entries = {email: {"email": email, "tokenPreview": None, "user": acct.get("user"), "active": email == active, "disabled": acct.get("disabled", False), "usage": None, "expiresAt": None} for email, acct in cfg.get("accounts", {}).items()}
+    accounts = cfg.get("accounts", {})
+    entries = {email: {"email": email, "tokenPreview": None, "user": acct.get("user"), "active": email == active, "disabled": acct.get("disabled", False), "usage": None, "expiresAt": None} for email, acct in accounts.items()}
 
     tasks = {}
     with ThreadPoolExecutor(max_workers=16) as pool:
-        for email, acct in cfg.get("accounts", {}).items():
+        for email, acct in accounts.items():
             token = acct.get("token")
             if not token:
                 continue
@@ -631,7 +633,24 @@ def api_accounts():
             except Exception:
                 pass
 
-    return jsonify({"accounts": list(entries.values()), "activeAccount": active, "total": total, "page": page, "per_page": per_page})
+    enabled_count = 0
+    if refresh:
+        for email in page_emails:
+            acct = accounts.get(email)
+            if not acct or not acct.get("disabled"):
+                continue
+            usage = entries[email].get("usage")
+            if not usage:
+                continue
+            windows = usage.get("windows", [])
+            if windows and all(w.get("usedPercent", 0) < 100 for w in windows):
+                cfg["accounts"][email]["disabled"] = False
+                entries[email]["disabled"] = False
+                enabled_count += 1
+        if enabled_count > 0:
+            save_config(cfg)
+
+    return jsonify({"accounts": list(entries.values()), "activeAccount": active, "total": total, "page": page, "per_page": per_page, "enabled": enabled_count})
 
 
 @app.route("/api/accounts/switch", methods=["POST"])

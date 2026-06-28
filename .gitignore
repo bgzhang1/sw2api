@@ -16,6 +16,9 @@ stagewise_tokens.txt
 *.png
 turnstile_debug.py
 
+# tech
+tech/
+
 # OS
 .DS_Store
 Thumbs.db

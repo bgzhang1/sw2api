@@ -126,7 +126,7 @@ tailwind.config = {
         <p class="text-sm text-slate-500">Manage stagewise accounts. Usage data fetched from API.</p>
       </div>
       <div class="flex items-center gap-2 text-xs text-slate-500">
-        <button class="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700" onclick="loadAccounts()">Refresh</button>
+        <button class="px-3 py-1.5 text-xs font-medium bg-indigo-600 text-white rounded-lg hover:bg-indigo-700" onclick="loadAccounts(false, true)">Refresh</button>
       </div>
     </div>
     <div id="accountsList"><span class="spinner"></span> Loading...</div>
@@ -458,8 +458,8 @@ let _acctPage = 1;
 const ACCT_PAGE_SIZE = 6;
 const ACCT_COLS = 3;
 
-async function loadAccounts(silent) {
-  const r = await api(`/api/accounts?page=${_acctPage}&per_page=${ACCT_PAGE_SIZE}`, {silent:true});
+async function loadAccounts(silent, withEnable) {
+  const r = await api(`/api/accounts?page=${_acctPage}&per_page=${ACCT_PAGE_SIZE}${withEnable?'&refresh=1':''}`, {silent:true});
   if (!r) { document.getElementById('accountsList').innerHTML = '<span class="text-red-600 text-sm">Failed to load accounts</span>'; return; }
   const incoming = r.accounts || [];
   const prevMap = {};
@@ -474,7 +474,8 @@ async function loadAccounts(silent) {
   if (_acctPage > maxPage) _acctPage = maxPage;
   renderAccounts();
   if (!silent) {
-    toast(`Refreshed page ${_acctPage}`, 'success');
+    const en = r.enabled || 0;
+    toast(`Refreshed page ${_acctPage}${en>0?` · ${en} re-enabled`:''}`, 'success');
     refreshAccounts();
   }
 }
